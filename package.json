@@ -1,0 +1,26 @@
+{
+  "name": "markdown-annotator",
+  "version": "1.0.0",
+  "description": "Single-file Markdown annotator: highlight passages, comment, copy one consolidated review for an AI coding agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GodHelpThisCoder/markdown-annotator.git"
+  },
+  "homepage": "https://github.com/GodHelpThisCoder/markdown-annotator",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test \"test/*.test.mjs\"",
+    "smoke": "node test/smoke.mjs",
+    "screenshots": "node tools/screenshots.mjs"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "markdown-it": "^14.3.2",
+    "playwright-core": "^1.63.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,188 @@
+<!doctype html>
+<!--
+  Markdown Annotator: open a Markdown document, comment on passages, copy every comment as one review.
+  MIT License, Copyright (c) 2026 GodHelpThisCoder. Source and docs: https://github.com/GodHelpThisCoder/markdown-annotator
+  Bundled third-party notices are at the end of this file.
+
+  FOR AI AGENTS AND SCRIPTS
+  Open a document by link (the page cannot read a file path itself):
+    markdown-annotator.html#path=docs/PLAN.md&md64=<base64 of the file's UTF-8 bytes>
+    md=<percent-encoded text> also works (md64 wins if both are given). path (or name=PLAN.md) is how the
+    review names the file; without either, the text is treated as pasted. Percent-encode spaces in the page's
+    own file:// path.
+  Windows (PowerShell):
+    $b = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\docs\PLAN.md"))
+    Start-Process chrome "file:///C:/tools/markdown-annotator.html#path=docs/PLAN.md&md64=$b"
+  macOS (run Chrome's binary, which "open" isn't: it can drop the # part of a file URL; & keeps your shell free):
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "file:///Users/me/markdown-annotator.html#path=docs/PLAN.md&md64=$(base64 -i docs/PLAN.md | tr -d '\n')" &
+  Linux:  google-chrome "file:///home/me/markdown-annotator.html#path=docs/PLAN.md&md64=$(base64 -w0 docs/PLAN.md)" &
+  Command lines are limited: about 32,000 characters on Windows (a file of about 20 KB), 128 KiB per argument
+  on Linux (about 90 KB), about 1 MB on macOS. For a bigger file, write a small launcher page and open that
+  instead; Chrome takes links up to 2 MB (a file of about 1.5 MB):
+    <meta http-equiv="refresh" content="0;url=file:///C:/tools/markdown-annotator.html#path=docs/PLAN.md&md64=...">
+  A link opens a snapshot that does not follow later edits. Opening the same path again updates the document
+  in place (changes are marked, and comments already sent move to "Earlier rounds"); if the person already
+  follows that file live, the link brings that document up instead. When the page is served from an http(s)
+  address, which any web page can link to, a link only reopens a document with exactly its path and text;
+  anything else opens as a separate copy (the five newest are kept, and one with a comment or a general note is
+  kept like any other document). Use the API to update a document there. Live reload needs the person to open the file once with Ctrl+O / Cmd+O (Chrome
+  grants file access only to their click).
+  A link that can't be used (empty, or not valid base64 or percent-encoding) shows the person why.
+
+  In a browser you drive (Playwright, DevTools, an extension, an in-app browser), use window.markdownAnnotator:
+    await markdownAnnotator.ready
+    await markdownAnnotator.open({ text, path: 'docs/PLAN.md' })   // or { text, name } or just { text }
+    markdownAnnotator.review()       // the review text Copy would produce, '' if nothing; { all: true } adds sent ones
+    markdownAnnotator.comments()     // [{ id, n, quote, comment, lineStart, lineEnd, section, sent, detached }]
+    markdownAnnotator.document()     // { name, path, source, live, generalNote } or null
+    markdownAnnotator.markdown()     // the document's Markdown source
+    markdownAnnotator.addComment({ quote, comment, occurrence })  // quote = text as the page shows it
+    markdownAnnotator.editComment(idOrNumber, comment)
+    markdownAnnotator.deleteComment(idOrNumber)                    // the person can Undo it
+    markdownAnnotator.setGeneralNote(text)
+  Reading never marks comments as sent. Errors say what to fix (a quote not found, or found several times without
+  an occurrence). Playwright can also set a file on input#file-input.
+  An app preview that loads this file as a data: URL cannot save anything; serve it from http://localhost
+  instead (for example: python3 -m http.server 8000 --bind 127.0.0.1, or py -m ... on Windows), then open
+  /markdown-annotator.html.
+-->
+<html lang="en" data-theme="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src * data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0e1013">
+<title>Markdown Annotator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2315181d'/%3E%3Cpath d='M8 9.5A2.5 2.5 0 0 1 10.5 7h11A2.5 2.5 0 0 1 24 9.5v8a2.5 2.5 0 0 1-2.5 2.5H15l-4.5 4v-4h0A2.5 2.5 0 0 1 8 17.5z' fill='%23e0a458'/%3E%3C/svg%3E">
+<!--CSS-->
+</head>
+<body>
+<header id="bar" class="bar" hidden>
+  <button class="icon-btn" id="btn-outline" type="button" aria-label="Outline (O)" title="Outline (O)" aria-controls="outline" aria-expanded="false">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h1.5M7.5 5h9.5M5.5 10h1.5M10 10h7M5.5 15h1.5M10 15h7" /></svg>
+  </button>
+  <button class="crumb" id="crumb" type="button" title="Outline (O)">
+    <span class="live" id="live" hidden></span>
+    <span class="crumb-file" id="crumb-file"></span><span class="crumb-sep" aria-hidden="true">/</span><span class="crumb-sec" id="crumb-sec"></span>
+  </button>
+  <button class="link-btn info" id="btn-pending" type="button" hidden title="The file changed on disk. Click to load it now." aria-label="File changed on disk. Load it now.">Updated ↻</button>
+  <button class="link-btn warn" id="btn-reconnect" type="button" hidden>Reconnect</button>
+  <button class="chip" id="btn-review" type="button" aria-controls="review" aria-expanded="false" title="Review all comments (R)"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h7A2.5 2.5 0 0 1 16 5.5v5a2.5 2.5 0 0 1-2.5 2.5H10l-3.5 3v-3A2.5 2.5 0 0 1 4 10.5z"/></svg><span id="chip-count">0</span></button>
+  <button class="primary-btn" id="btn-copy" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6.5" y="6.5" width="10" height="11" rx="2"/><path d="M13.5 6.5V4.5a2 2 0 0 0-2-2h-6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h1"/></svg><span id="copy-label">Copy</span></button>
+  <button class="icon-btn" id="btn-menu" type="button" aria-label="Menu" title="Menu" aria-haspopup="menu" aria-expanded="false" aria-controls="menu">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="4.5" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="15.5" cy="10" r="1.4"/></svg>
+  </button>
+</header>
+
+<div id="menu" class="menu" role="menu" aria-label="Menu" hidden></div>
+
+<main id="main">
+  <section id="empty" class="empty" hidden>
+    <div class="empty-inner">
+      <h1 class="empty-title"><span class="logo" aria-hidden="true"></span>Markdown Annotator</h1>
+      <p class="empty-lede">Open a Markdown file, highlight passages and comment on them, then copy everything as one review, ready to paste into an AI assistant, a chat or a pull request.</p>
+      <button class="drop" id="drop" type="button">
+        <span class="drop-main">Drop a Markdown file here</span>
+        <span class="drop-sub"><span class="nw">or click to open <kbd data-mod>O</kbd></span><span class="sep"> · </span><span class="nw">or paste Markdown text <kbd data-mod>V</kbd></span></span>
+      </button>
+      <p class="try"><button class="link-btn" id="try-sample" type="button">Try it on a sample document</button></p>
+      <div id="recent" class="recent" hidden>
+        <h2>Recent</h2>
+        <ul id="recent-list"></ul>
+      </div>
+      <ol class="how">
+        <li>Select text, press <kbd>C</kbd>, type, press <kbd>Enter</kbd>.</li>
+        <li>Press <kbd data-mod>Enter</kbd> to copy your comments as one review, then paste it where it is needed.</li>
+        <li>When the file changes on disk, it reloads here in place. Changed blocks are marked; <kbd>N</kbd> jumps between them.</li>
+      </ol>
+      <p class="fine"><span id="fine">Documents and comments stay in this browser (other local HTML files opened in Chrome can read the same storage).</span> <button class="link-btn" id="forget-all" type="button" hidden>Forget all</button> · Shortcuts <kbd>?</kbd></p>
+    </div>
+  </section>
+  <div id="detached" class="detached" hidden></div>
+  <article id="doc" class="md" hidden></article>
+  <div id="doc-end" class="doc-end" hidden></div>
+</main>
+
+<button id="pill" class="pill" type="button" hidden tabindex="-1"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h7A2.5 2.5 0 0 1 16 5.5v5a2.5 2.5 0 0 1-2.5 2.5H10l-3.5 3v-3A2.5 2.5 0 0 1 4 10.5z"/></svg>Comment <kbd>C</kbd></button>
+
+<section id="composer" class="composer" role="dialog" aria-modal="false" aria-labelledby="cmp-title" hidden>
+  <div class="cmp-head">
+    <span id="cmp-title" class="cmp-title"></span>
+    <span id="cmp-flag" class="cmp-flag" hidden></span>
+  </div>
+  <blockquote id="cmp-quote" class="cmp-quote" hidden></blockquote>
+  <textarea id="cmp-text" rows="2" spellcheck="true" aria-label="Comment" placeholder="What should change?"></textarea>
+  <div class="cmp-foot">
+    <button class="text-btn danger" id="cmp-delete" type="button" hidden>Delete</button>
+    <span class="cmp-hint"><kbd>Enter</kbd> save · <kbd>Shift</kbd><kbd>Enter</kbd> new line · <kbd data-mod>Enter</kbd> save &amp; copy · <kbd>Esc</kbd> cancel</span>
+    <span class="cmp-hint-short"><kbd>Enter</kbd> save · <kbd>Shift</kbd><kbd>Enter</kbd> new line</span>
+    <button class="text-btn" id="cmp-cancel" type="button">Cancel</button>
+    <button class="primary-btn small" id="cmp-save" type="button">Save</button>
+  </div>
+</section>
+
+<aside id="outline" class="drawer drawer-left" role="dialog" aria-modal="true" aria-label="Outline" hidden>
+  <div class="drawer-head"><h2>Outline</h2><button class="icon-btn small" data-close type="button" aria-label="Close outline"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button></div>
+  <nav id="outline-list" class="outline-list" aria-label="Headings"></nav>
+</aside>
+
+<aside id="review" class="drawer drawer-right" role="dialog" aria-modal="true" aria-label="Review" hidden>
+  <div class="drawer-head"><h2>Review</h2><button class="icon-btn small" data-close type="button" aria-label="Close review"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button></div>
+  <div class="drawer-body">
+    <div id="review-list" class="review-list"></div>
+    <label class="field-label" for="general">General note <span class="muted">(not tied to a passage)</span></label>
+    <textarea id="general" class="field general" rows="3" placeholder="Overall feedback…"></textarea>
+    <label class="field-label spaced" for="path">File path in the review <span class="muted">(optional)</span></label>
+    <input id="path" class="field" type="text" spellcheck="false" autocomplete="off" aria-describedby="path-help">
+    <p class="field-help" id="path-help">Chrome tells the page only the file's name. Add its folder if the reader needs it.</p>
+    <details id="preview-box" class="preview-box">
+      <summary><span class="field-label">Copy preview</span></summary>
+      <pre id="preview" class="preview" tabindex="0"></pre>
+    </details>
+  </div>
+  <div class="drawer-foot">
+    <span id="foot-summary" class="foot-summary"></span>
+    <button class="primary-btn small" id="btn-copy-2" type="button">Copy</button>
+  </div>
+</aside>
+
+<div id="scrim" class="scrim" hidden></div>
+
+<section id="settings" class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+  <div class="modal-card">
+    <div class="drawer-head"><h2 id="settings-title">Settings</h2><button class="icon-btn small" data-close type="button" aria-label="Close settings"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button></div>
+    <div class="modal-body">
+      <div class="set-row"><span class="field-label">Theme</span><div class="seg" id="set-theme" role="group" aria-label="Theme"><button type="button" aria-pressed="false" data-v="system">System</button><button type="button" aria-pressed="false" data-v="light">Light</button><button type="button" aria-pressed="false" data-v="dark">Dark</button></div></div>
+      <div class="set-row"><span class="field-label">Text size</span><div class="seg" id="set-size" role="group" aria-label="Text size"><button type="button" aria-pressed="false" data-v="s">S</button><button type="button" aria-pressed="false" data-v="m">M</button><button type="button" aria-pressed="false" data-v="l">L</button></div></div>
+      <div class="set-row"><span class="field-label">Line length</span><div class="seg" id="set-width" role="group" aria-label="Line length"><button type="button" aria-pressed="false" data-v="narrow">Narrow</button><button type="button" aria-pressed="false" data-v="normal">Normal</button><button type="button" aria-pressed="false" data-v="wide">Wide</button></div></div>
+      <label class="set-row check"><input type="checkbox" id="set-wrap"> <span>Wrap long lines in code blocks (diagrams and trees never wrap)</span></label>
+      <label class="set-row check"><input type="checkbox" id="set-notes"> <span>Show comments inline under the passage</span></label>
+      <label class="set-row check"><input type="checkbox" id="set-hints"> <span>Label tables and code that scroll sideways (the edge fade stays)</span></label>
+      <label class="field-label set-section" for="set-header">Instructions at the top of the copied review</label>
+      <textarea id="set-header" class="field" rows="6"></textarea>
+      <p class="fine">Left as the default, these instructions adapt to each review: they name the file or describe pasted text, and mention comments, quotes and line numbers only when the review has them. Edited, they are used as written, with <code>{file}</code> (the file), <code>{count}</code> (what is included) and <code>{lines}</code> (how current the line numbers are) filled in. Leave empty for no instructions. <button class="link-btn" id="set-header-reset" type="button">Reset to default</button></p>
+    </div>
+  </div>
+</section>
+
+<section id="help" class="modal" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+  <div class="modal-card">
+    <div class="drawer-head"><h2 id="help-title">Shortcuts</h2><button class="icon-btn small" data-close type="button" aria-label="Close shortcuts"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button></div>
+    <div class="modal-body">
+      <table class="keys" id="keys"></table>
+      <p class="fine">Selecting text with the keyboard: turn on caret browsing with <kbd>F7</kbd>, then hold <kbd>Shift</kbd> and use the arrow keys.</p>
+      <p class="fine"><a href="https://github.com/GodHelpThisCoder/markdown-annotator" target="_blank" rel="noopener noreferrer">Markdown Annotator</a> (MIT). Inspired by <a href="https://github.com/Ch00k/claude-review" target="_blank" rel="noopener noreferrer">Ch00k/claude-review</a>. Markdown by <a href="https://github.com/markdown-it/markdown-it" target="_blank" rel="noopener noreferrer">markdown-it</a> (MIT). Documents and comments are kept only in this browser's storage.</p>
+    </div>
+  </div>
+</section>
+
+<div id="dropzone" class="dropzone" hidden><div>Drop to open</div></div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<input type="file" id="file-input" aria-label="Open a Markdown file" accept=".md,.markdown,.mdown,.mkd,.mdx,.txt,text/markdown,text/plain" hidden>
+
+<!--VENDOR-->
+<!--APP-->
+</body>
+</html>
