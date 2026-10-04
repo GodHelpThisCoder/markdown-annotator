@@ -2113,7 +2113,7 @@ describe('several tabs on a file followed on disk', () => {
         const tx = q.result.transaction(['docs', 'meta'], 'readwrite');
         const docs = tx.objectStore('docs');
         const g = docs.get(k);
-        g.onsuccess = () => { const r = g.result; r.handle = h; docs.put(r); tx.objectStore('meta').delete(`handle:${k}`); };
+        g.onsuccess = () => { const r = g.result; r.handle = h; docs.put(r); };
         tx.oncomplete = () => { q.result.close(); res(); };
       };
     }), key);
@@ -2131,7 +2131,57 @@ describe('several tabs on a file followed on disk', () => {
     await until(async () => (await idbRecord(a, key)).handle === null, { message: 'moved out once visible' });
     rec = await idbRecord(a, key);
     assert.equal(rec.path, 'docs/SHOWN.md');
-    await until(async () => (await a.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`), { message: 'handed on to its own entry' });
+    assert.ok((await a.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`), 'its own entry is still there');
+  }));
+
+  test('a tab that meets a record still holding a 1.0.0 handle moves it to its own entry', () => withDisk(async ({ file, otherFile, open, live }) => {
+    const a = await open();
+    await live(a);
+    const key = await docKey(a);
+    await a.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Why?' }));
+    await sleep(300);
+    // B follows another file, so it doesn't hold this document's handle.
+    const b = await open();
+    await dropFile(b, otherFile);
+    await until(async () => { const k = await docKey(b); return k && k !== key; }, { message: 'B on the other file' });
+    // A 1.0.0 tab writes this document with its handle inside, and its own entry is gone.
+    await a.evaluate((k) => new Promise((res) => {
+      const h = window.__markdownAnnotator.state.doc.handle;
+      const q = indexedDB.open('markdown-annotator.v1');
+      q.onsuccess = () => {
+        const tx = q.result.transaction(['docs', 'meta'], 'readwrite');
+        const docs = tx.objectStore('docs');
+        const g = docs.get(k);
+        g.onsuccess = () => { const r = g.result; r.handle = h; docs.put(r); tx.objectStore('meta').delete(`handle:${k}`); };
+        tx.oncomplete = () => { q.result.close(); res(); };
+      };
+    }), key);
+    // A closing tab's journal for it reaches B, which merges it into the record.
+    await a.evaluate((k) => localStorage.setItem(`markdown-annotator.v1.journal.gone.${k}`, JSON.stringify({
+      key: k, at: Date.now(), seq: 1, comments: [], deleted: {}, general: 'Merged by B.', generalAt: Date.now(), generalSent: false, generalSentAt: 0, path: '', pathAt: 0,
+    })), key);
+    await until(async () => (await idbRecord(b, key)).general === 'Merged by B.', { message: 'B merged the journal' });
+    const rec = await idbRecord(b, key);
+    assert.equal(rec.handle, null, 'stripped from the record');
+    await until(async () => (await b.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`), { message: 'moved to its own entry' });
+  }));
+
+  test('handles of files opened while the page is hidden are all stored once it shows', () => withDisk(async ({ file, otherFile, open }) => {
+    const a = await open();
+    const show = (v) => a.evaluate((x) => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => x }); document.dispatchEvent(new Event('visibilitychange')); }, v);
+    await a.evaluate(() => Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }));
+    const keys = [];
+    for (const f of [file, otherFile]) {
+      const before = await docKey(a);
+      await dropFile(a, f);
+      await until(async () => { const k = await docKey(a); return k && k !== before; }, { message: 'opened' });
+      keys.push(await docKey(a));
+    }
+    await sleep(300);
+    const stored = () => a.evaluate(() => window.__markdownAnnotator.metaKeys());
+    assert.equal((await stored()).filter((k) => String(k).startsWith('handle:')).length, 0, 'nothing written while hidden');
+    await show('visible');
+    await until(async () => { const m = await stored(); return keys.every((k) => m.includes(`handle:${k}`)); }, { message: 'both written once shown' });
   }));
 
   test('a handle entry outlives its record while Forget can still be undone, then goes', () => withDisk(async ({ open, live }) => {
@@ -2236,6 +2286,19 @@ describe('more on several tabs', () => {
     await page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'Status survives', comment: 'Only in memory.' }));
     await sleep(300);
     await page.evaluate(() => window.dispatchEvent(new Event('pagehide')));
+    const j = await page.evaluate(() => { const k = Object.keys(localStorage).find((x) => x.includes('.journal.')); return k && JSON.parse(localStorage.getItem(k)); });
+    assert.ok(j && j.comments.some((c) => c.body === 'Only in memory.'), 'the journal holds the comment');
+  }));
+
+  test('Close document in a tab whose storage failed leaves its changes in the journal', () => withApp({}, async ({ page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    await sleep(300);
+    await page.evaluate(() => { IDBDatabase.prototype.transaction = function () { throw new DOMException('gone', 'UnknownError'); }; });
+    await page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Only in memory.' }));
+    await sleep(300);
+    await page.click('#btn-menu');
+    await page.getByRole('menuitem', { name: 'Close document' }).click();
+    await until(() => page.evaluate(() => !window.__markdownAnnotator.state.doc), { message: 'closed' });
     const j = await page.evaluate(() => { const k = Object.keys(localStorage).find((x) => x.includes('.journal.')); return k && JSON.parse(localStorage.getItem(k)); });
     assert.ok(j && j.comments.some((c) => c.body === 'Only in memory.'), 'the journal holds the comment');
   }));

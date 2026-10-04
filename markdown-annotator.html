@@ -51,7 +51,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Er81E07nyGdaYb5FZ+ZJc31ZT1QNc5MYZvVfhCqgl2o=' 'sha256-hi0UQtGvdspy0ZQhC+/rTlx0vlBaabfU0UNbGSOPHAg='; style-src 'unsafe-inline'; img-src * data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Er81E07nyGdaYb5FZ+ZJc31ZT1QNc5MYZvVfhCqgl2o=' 'sha256-/FXwqpm+cFWPUHeEMfXAsKud5JZ7pPcvN7Ue1+PHtO0='; style-src 'unsafe-inline'; img-src * data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0e1013">
 <title>Markdown Annotator</title>
@@ -1488,8 +1488,10 @@ textarea.field { min-height: 4.6em; max-height: 40vh; resize: vertical; }
     // while an IndexedDB write holding one is in flight, and every save writes the record, so handles are
     // kept apart in meta (see handleFor) and only written when a file is opened.
     const bare = (r) => { if (!r || !('handle' in r)) return r; const { handle, ...rest } = r; return rest; };
-    // A handle found in a record (one a 1.0.0 tab wrote) is kept apart rather than dropped (see keepHandle).
-    const handedOn = (key, handle) => { try { keepHandle(key, handle); } catch { /* not yet set up */ } };
+    // A handle found in a record (one a 1.0.0 tab wrote) is kept apart rather than dropped (see keepHandle),
+    // unless this tab already has that document's handle: then it is the same file or, from a 1.0.0 tab that
+    // follows another file with the same name, the wrong one.
+    const handedOn = (key, handle) => { if (!handles.has(key)) keepHandle(key, handle); };
     let memOnly = typeof indexedDB === 'undefined';
     function open() {
       if (!dbp) {
@@ -1668,6 +1670,7 @@ textarea.field { min-height: 4.6em; max-height: 40vh; resize: vertical; }
         if (!r.handle) continue;
         try {
           await store.setMeta(handleKey(r.key), r.handle);
+          handles.set(r.key, r.handle); // written just now: the update below needn't hand it on again
           await store.update(r.key, (cur) => (cur ? { ...cur, live: true } : null));
         } catch { ok = false; }
       }

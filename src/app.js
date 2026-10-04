@@ -333,8 +333,10 @@
     // while an IndexedDB write holding one is in flight, and every save writes the record, so handles are
     // kept apart in meta (see handleFor) and only written when a file is opened.
     const bare = (r) => { if (!r || !('handle' in r)) return r; const { handle, ...rest } = r; return rest; };
-    // A handle found in a record (one a 1.0.0 tab wrote) is kept apart rather than dropped (see keepHandle).
-    const handedOn = (key, handle) => { try { keepHandle(key, handle); } catch { /* not yet set up */ } };
+    // A handle found in a record (one a 1.0.0 tab wrote) is kept apart rather than dropped (see keepHandle),
+    // unless this tab already has that document's handle: then it is the same file or, from a 1.0.0 tab that
+    // follows another file with the same name, the wrong one.
+    const handedOn = (key, handle) => { if (!handles.has(key)) keepHandle(key, handle); };
     let memOnly = typeof indexedDB === 'undefined';
     function open() {
       if (!dbp) {
@@ -513,6 +515,7 @@
         if (!r.handle) continue;
         try {
           await store.setMeta(handleKey(r.key), r.handle);
+          handles.set(r.key, r.handle); // written just now: the update below needn't hand it on again
           await store.update(r.key, (cur) => (cur ? { ...cur, live: true } : null));
         } catch { ok = false; }
       }
