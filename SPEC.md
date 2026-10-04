@@ -264,12 +264,16 @@ returns to the comment's note.
   `updatedAt`. A record never holds the `FileSystemFileHandle`: Chrome 153 and 154 crash the whole browser when a
   tab closes while an IndexedDB write holding a handle is in flight. Each handle is kept in the `meta` store
   under `handle:<key>`, written when the file is opened or reconnected and read only when a tab restores or
-  reopens that document (records saved by 1.0.0 are moved over on the next start). Files with the same name are
-  told apart with `isSameEntry`. A file opened without a handle joins only a record that never had one.
+  reopens that document (records saved by 1.0.0 are moved over once, on the first start of 1.0.1). That write
+  waits while the page is hidden, but a tab closed within a few tens of milliseconds of opening a file can still
+  meet the crash. Files with the same name are told apart with `isSameEntry`. A file opened without a handle
+  joins only a record that never had one.
   Settings and the per-document scroll position are kept in `localStorage`.
 - Every save is a read-merge-write in one IndexedDB transaction. Comments merge by id: the newer `updated`
   wins, and a tombstone wins over anything older than itself. Two tabs therefore never overwrite each other.
-  Discrete actions save at once. A page being hidden saves only when something changed since the last save,
+  Discrete actions save at once; a save waiting to start takes in later changes instead of queueing another
+  (40 quick API calls make a handful of writes). A page being hidden saves only when something changed since the
+  last save that reached IndexedDB (a tab that only took in other tabs' changes has nothing to save),
   and `pagehide` starts no IndexedDB work at all: it writes a small synchronous `localStorage` journal (one per
   tab) when something is unsaved. Another open tab merges that journal at once (the `storage` event), or the
   next start does, so closing or reloading right after a change loses nothing.
@@ -278,11 +282,12 @@ returns to the comment's note.
   Undo. If IndexedDB is unavailable, the page says so and keeps everything in memory for the tab.
 - A refresh restores the last document immediately from the cached text. If Chrome still grants read
   permission, watching resumes; otherwise a "Reconnect" button asks for it.
-- Chrome 153 and early 154 builds (before 154.0.8037.95) crash the whole browser when an Incognito or Guest
-  window reads a file handle back from IndexedDB (crbug 562119515), and a page can't tell those windows apart.
-  On those builds a document follows its file only in the tab that opened it; another tab or a reload shows
-  the saved copy with Reconnect. A file picked through Reconnect, or a dropped or opened file whose text is exactly
-  the saved text, rejoins the same document; another file with the same name opens as its own.
+- Chrome 153, 154 before 154.0.8037.95, and 155 test builds before 155.0.8059.12 crash the whole browser when an
+  Incognito or Guest window reads a file handle back from IndexedDB (crbug 562119515), and a page can't tell
+  those windows apart. On those builds a document follows its file only in the tab that opened it; another tab
+  or a reload shows the saved copy with Reconnect. Only a file picked through that document's own Reconnect
+  rejoins it: another file with the same name, even with the same text, may be another copy, so it opens as a
+  document of its own, with a note on using Reconnect.
 - The start screen lists up to 8 recent documents, with their comment counts. Opening one asks for permission
   inside the click.
 - Other tabs showing the same document merge its saved comments in through `BroadcastChannel`. A tab with its

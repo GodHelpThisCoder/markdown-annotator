@@ -411,6 +411,9 @@
       del: (key) => { mem.docs.delete(key); return attempt(() => run('docs', 'readwrite', (s) => s.delete(key)), () => null); },
       delIf: (key, ok) => { const m = mem.docs.get(key); if (m && ok(m)) mem.docs.delete(key); return attempt(() => delIf(key, ok), () => null); },
       all: () => attempt(() => run('docs', 'readonly', (s) => s.getAll()).then((r) => r || []), () => [...mem.docs.values()]),
+      docKeys: () => attempt(() => run('docs', 'readonly', (s) => s.getAllKeys()).then((r) => r || []), () => [...mem.docs.keys()]),
+      // False once IndexedDB has failed and this tab keeps data in memory only.
+      durable: () => !memOnly,
       getMeta: (k) => attempt(() => run('meta', 'readonly', (s) => s.get(k)).then((r) => r && r.v), () => mem.meta.get(k)),
       setMeta: (k, v) => { mem.meta.set(k, v); return attempt(() => run('meta', 'readwrite', (s) => s.put({ k, v })), () => null); },
       delMeta: (k) => { mem.meta.delete(k); return attempt(() => run('meta', 'readwrite', (s) => s.delete(k)), () => null); },
@@ -432,12 +435,23 @@
   let handleReadsSafe = true;
   // The one routine write of a handle, when a file is opened or reconnected: a tab closed within those few
   // milliseconds could still meet the Chrome crash, but no save, sync or close writes one.
-  function keepHandle(key, handle) {
-    if (!handle || handles.get(key) === handle) return;
-    handles.set(key, handle);
+  let handleLater = null; // one that arrived while the page was hidden (it may be closing): written once it shows
+  function writeHandle(key, handle) {
     // A handle that can't be stored still lets this tab follow the file.
     Promise.resolve(store.setMeta(handleKey(key), handle)).catch(() => {});
   }
+  function keepHandle(key, handle) {
+    if (!handle || handles.get(key) === handle) return;
+    handles.set(key, handle);
+    if (document.visibilityState === 'hidden') { handleLater = { key, handle }; return; }
+    writeHandle(key, handle);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !handleLater) return;
+    const { key, handle } = handleLater;
+    handleLater = null;
+    if (handles.get(key) === handle) writeHandle(key, handle);
+  });
   async function handleFor(key) {
     if (handles.has(key)) return handles.get(key);
     if (!handleReadsSafe) return null;
@@ -464,8 +478,9 @@
     } catch { /* fall back to the user agent string */ }
     if (!v) { const m = /Chrom(?:e|ium)\/(\d+(?:\.\d+)*)/.exec(navigator.userAgent); if (m) v = m[1]; }
     const [major = 0, , build = 0, patch = 0] = v.split('.').map((x) => parseInt(x, 10) || 0);
+    // A reduced version string ('155.0.0.0') says only the major number: 155 then counts as fixed, 154 doesn't.
     handleReadsSafe = !(major === 153 || (major === 154 && (build < 8037 || (build === 8037 && patch < 95)))
-      || (major === 155 && build === 8059 && patch < 12));
+      || (major === 155 && build > 0 && (build < 8059 || (build === 8059 && patch < 12))));
   }
   // Before 1.0.1 each record carried its file handle: move any such handle to its own entry, once, and drop
   // handle entries whose record is gone (keys are listed first, so a document opened meanwhile keeps its own).
@@ -473,17 +488,31 @@
   // reach it, and an Incognito window could only hold one if 1.0.0 ran there in the same session.
   async function tidyHandles() {
     let keys = [];
-    let recs = [];
+    let docKeys = [];
     let forgotAt = 0;
-    try { keys = await store.metaKeys(); recs = await store.all(); forgotAt = (await store.getMeta('forgotAt')) || 0; } catch { return; }
-    const known = new Set(recs.map((r) => r.key));
-    for (const r of recs) {
-      if (!r.handle) continue;
-      try { await store.setMeta(handleKey(r.key), r.handle); } catch { continue; }
-      try { await store.update(r.key, (cur) => (cur ? { ...cur, live: true } : null)); } catch { /* next start */ }
+    let moved = false;
+    try {
+      keys = await store.metaKeys();
+      docKeys = await store.docKeys();
+      forgotAt = (await store.getMeta('forgotAt')) || 0;
+      moved = !!(await store.getMeta('handlesMoved'));
+    } catch { return; }
+    if (!moved && store.durable()) {
+      let recs = [];
+      let ok = true;
+      try { recs = await store.all(); } catch { recs = []; ok = false; }
+      for (const r of recs) {
+        if (!r.handle) continue;
+        try {
+          await store.setMeta(handleKey(r.key), r.handle);
+          await store.update(r.key, (cur) => (cur ? { ...cur, live: true } : null));
+        } catch { ok = false; }
+      }
+      if (ok) store.setMeta('handlesMoved', 1);
     }
     // A document forgotten in the last minute may still come back with Undo, so its handle stays.
     if (forgotAt > now() - 60000) return;
+    const known = new Set(docKeys);
     for (const k of keys) if (typeof k === 'string' && k.startsWith('handle:') && !known.has(k.slice(7))) store.delMeta(k);
   }
 
@@ -605,6 +634,7 @@
     const next = [];
     for (const c of m.comments) {
       incoming.add(c.id);
+      if (deleted[c.id] >= (c.updated || 0)) continue; // an older save's merge can still hold one deleted since
       const l = local.get(c.id);
       if (l && (l.updated || 0) >= (c.updated || 0)) next.push(l);
       else { const copy = { ...c }; if (state.index) anchor(copy); next.push(copy); changed = true; }
@@ -644,16 +674,24 @@
 
   let saving = Promise.resolve();
   let closing = false;
+  let queued = null; // a save not started yet: a newer call for the same document replaces what it will write
+  let saveJobs = 0;
   function saveNow() {
     if (!state.doc) return saving;
     const doc = state.doc;
-    const sig = saveSig();
-    const seq = ++journalSeq;
     const local = serialize();
-    saving = saving.then(async () => {
+    const job = { local, sig: saveSig(), seq: ++journalSeq };
+    if (queued && queued.doc === doc) { Object.assign(queued, job); return queued.promise; }
+    job.doc = doc;
+    queued = job;
+    saveJobs++;
+    job.promise = saving = saving.then(async () => {
+      if (queued === job) queued = null;
+      const { local, sig, seq } = job;
       let merged = null;
       try { merged = await store.update(local.key, (stored) => mergeRecords(local, stored)); } catch { /* memory copy kept */ }
-      if (merged) {
+      // A save that only reached memory (IndexedDB failed) doesn't count: leaving keeps journaling.
+      if (merged && store.durable()) {
         if (state.doc === doc) savedSig = sig;
         // A journal this tab wrote before this save is covered now.
         const j = lsGet(journalKey(local.key), null);
@@ -665,8 +703,8 @@
         ssSet(`${NS}.tab`, local.key);
       }
       if (channel) channel.postMessage({ type: 'saved', key: local.key, tab: TAB_ID });
-    }).catch((e) => console.warn('[markdown-annotator] save failed', e));
-    return saving;
+    }).catch((e) => console.warn('[markdown-annotator] save failed', e)).finally(() => { saveJobs--; });
+    return job.promise;
   }
   const saveSoon = debounce(saveNow, 300);
   const scrollKey = (key) => `${NS}.scroll.${key}`;
@@ -678,7 +716,7 @@
   function writeJournal() {
     if (!state.doc) return;
     lsSet(journalKey(state.doc.key), {
-      key: state.doc.key, at: now(), seq: ++journalSeq, comments: state.comments.map(persistedComment), deleted: state.deleted,
+      key: state.doc.key, at: now(), seq: ++journalSeq, lastBatch: state.lastBatch, comments: state.comments.map(persistedComment), deleted: state.deleted,
       general: state.general, generalAt: state.generalAt, generalSent: state.generalSent, generalSentAt: state.generalSentAt || 0,
       path: state.path, pathAt: state.pathAt,
     });
@@ -732,7 +770,11 @@
     if (!dom.composer.hidden) { state.syncPending = true; return; }
     state.syncPending = false;
     const rec = await store.get(state.doc.key);
-    if (rec && state.doc && rec.key === state.doc.key) adoptMerged(mergeRecords(serialize(), rec));
+    if (!rec || !state.doc || rec.key !== state.doc.key) return;
+    // Nothing of this tab's own unsaved: taking in what is stored leaves it clean, so closing it saves nothing.
+    const clean = saveJobs === 0 && !dirty() && store.durable();
+    adoptMerged(mergeRecords(serialize(), rec));
+    if (clean) savedSig = saveSig();
   }
   // The start screen's list follows other tabs' saves, at most every 250 ms and only while it shows.
   const refreshEmpty = debounce(() => { if (!state.doc && !dom.empty.hidden && document.visibilityState === 'visible') showEmpty(); }, 250);
@@ -1404,6 +1446,7 @@
   async function findRecord(name, handle, path = '', shared = false, text = null) {
     const all = (await store.all()).filter((r) => r.source !== 'paste' && r.name === name).sort((a, b) => b.updatedAt - a.updatedAt);
     if (!all.length) return { rec: null, taken: false };
+    let orphan = false; // a saved review of a file with this name whose handle this tab can't read
     if (handle) {
       for (const r of all) {
         if (!isLive(r)) continue;
@@ -1411,11 +1454,13 @@
         if (!h) continue;
         try { if (await h.isSameEntry(handle)) return { rec: r, taken: true }; } catch { /* stale handle */ }
       }
-      // A followed document whose handle this tab can't read (see handleFor) takes a file back only from its
-      // own Reconnect, or when the file has exactly the saved text: another project's PLAN.md never joins it.
-      const unknown = all.filter((r) => isLive(r) && !handles.has(r.key));
-      const again = unknown.find((r) => r.key === reconnectKey) || unknown.find((r) => text != null && r.text === text);
+      // A document takes a different handle only from its own Reconnect: a file with the same name, even the
+      // same text, may be another copy (another project's PLAN.md), and must not join its review.
+      const rk = reconnectKey;
+      reconnectKey = null;
+      const again = rk && all.find((r) => r.key === rk);
       if (again) return { rec: again, taken: true };
+      orphan = all.some((r) => isLive(r) && !handles.has(r.key));
     }
     // A link or a script names the file by its path: it joins the record for that path, even one the
     // person follows live; without a path, only a record that has neither a path nor a live file.
@@ -1431,7 +1476,7 @@
     }
     // Without a matching handle, join only a record that never had one: another project's
     // handle-backed PLAN.md must not absorb this file.
-    return { rec: all.find((r) => !isLive(r) && !provisional(r)) || all.find((r) => !isLive(r)) || null, taken: true };
+    return { rec: all.find((r) => !isLive(r) && !provisional(r)) || all.find((r) => !isLive(r)) || null, taken: true, orphan };
   }
 
   // Sent comments were handed over. Once the file changes after they were sent, they belong to an
@@ -1489,6 +1534,9 @@
       const found = await findRecord(name, handle, path, shared, text);
       rec = found.rec;
       key = rec ? rec.key : 'file:' + name + (found.taken ? ':' + uid() : '');
+      if (found.orphan) {
+        toast(`Opened ${name} as a document of its own. To follow it in an earlier review of ${name}, open that review and choose Reconnect.`, { id: 'rejoin', ms: 10000 });
+      }
     }
     const changed = !!(rec && rec.text !== text);
     loadRecordState(rec);
@@ -1681,7 +1729,7 @@
     await saveNow();
     await cleared;
     closing = false;
-    if (key) lsSet(`${NS}.journal.${key}`, null);
+    if (key) lsSet(journalKey(key), null);
     state.doc = null;
     state.comments = [];
     state.deleted = {};
@@ -1779,7 +1827,8 @@
   async function reopen(key) {
     const rec = await store.get(key);
     if (!rec) { showEmpty(); return false; }
-    const handle = isLive(rec) ? await handleFor(key) : null;
+    const handle = isLive(rec) ? rec.handle || (await handleFor(key)) : null;
+    if (rec.handle) keepHandle(key, rec.handle); // a record a 1.0.0 tab wrote
     if (handle) {
       let granted = false;
       try { granted = (await handle.requestPermission({ mode: 'read' })) === 'granted'; } catch { granted = false; }
@@ -1800,7 +1849,8 @@
 
   async function restoreRecord(rec) {
     const live = isLive(rec);
-    const handle = live ? await handleFor(rec.key) : null;
+    const handle = live ? rec.handle || (await handleFor(rec.key)) : null;
+    if (rec.handle) keepHandle(rec.key, rec.handle); // a record a 1.0.0 tab wrote
     loadRecordState(rec);
     state.doc = { key: rec.key, name: rec.name, source: rec.source || 'file', text: rec.text, handle, live, lastModified: rec.lastModified || 0, size: rec.size || 0, copy: provisional(rec) };
     savedSig = saveSig();
@@ -3560,6 +3610,8 @@
     metaKeys: () => store.metaKeys(),
     get handleReadsSafe() { return handleReadsSafe; },
     checkHandleReads: () => checkHandleReads(),
+    // What Reconnect does before its file picker: the next file opened rejoins the open document.
+    armReconnect: () => { reconnectKey = state.doc ? state.doc.key : null; },
     applyUpdate: (text) => applyUpdate(normalizeSource(text)),
     copy: (opts) => copyReview(opts),
     selectText(exact, nth = 0) {

@@ -2019,7 +2019,10 @@ describe('several tabs on a file followed on disk', () => {
       await sleep(1000);
       assert.ok(!crashed(), `Chrome crashed after closing tab ${i + 1}`);
       a = b;
-      if (!(await a.evaluate(() => !!window.__markdownAnnotator.state.doc.handle))) await live(a);
+      if (!(await a.evaluate(() => !!window.__markdownAnnotator.state.doc.handle))) {
+        await a.evaluate(() => window.__markdownAnnotator.armReconnect()); // Reconnect, then the file picker
+        await live(a);
+      }
     }
     await until(async () => (await comments(a)).length === 12, { message: 'all 12 comments in the last tab' });
   }));
@@ -2042,7 +2045,7 @@ describe('several tabs on a file followed on disk', () => {
         const tx = q.result.transaction(['docs', 'meta'], 'readwrite');
         const docs = tx.objectStore('docs');
         const g = docs.get(k);
-        g.onsuccess = () => { const r = g.result; delete r.live; r.handle = h; docs.put(r); tx.objectStore('meta').delete(`handle:${k}`); };
+        g.onsuccess = () => { const r = g.result; delete r.live; r.handle = h; docs.put(r); tx.objectStore('meta').delete(`handle:${k}`); tx.objectStore('meta').delete('handlesMoved'); };
         tx.oncomplete = () => { q.result.close(); res(); };
       };
     }), key);
@@ -2063,7 +2066,7 @@ describe('several tabs on a file followed on disk', () => {
     assert.equal(await docKey(b), await docKey(a));
   }, { reads: true }));
 
-  test('where it can\'t, a second tab offers Reconnect, and the same file dropped there rejoins the document', () => withDisk(async ({ open, live }) => {
+  test('where it can\'t, a second tab offers Reconnect, which rejoins the document; a plain drop opens on its own', () => withDisk(async ({ file, open, live }) => {
     const a = await open();
     await live(a);
     await a.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Why?' }));
@@ -2072,9 +2075,16 @@ describe('several tabs on a file followed on disk', () => {
     await until(() => b.evaluate(() => window.__markdownAnnotator.state.liveMode === 'perm'), { message: 'Reconnect offered' });
     assert.equal(await b.evaluate(() => !!window.__markdownAnnotator.state.doc.handle), false);
     assert.ok(await visible(b, '#btn-reconnect'));
+    await b.evaluate(() => window.__markdownAnnotator.armReconnect()); // Reconnect, then the file picker
     await live(b);
     assert.equal(await docKey(b), key, 'the same document, not a new one');
     assert.equal((await comments(b)).length, 1);
+    // The same file dropped without Reconnect may be any copy: it opens on its own and says how to rejoin.
+    const c = await open();
+    await until(() => c.evaluate(() => window.__markdownAnnotator.state.liveMode === 'perm'), { message: 'Reconnect offered again' });
+    await dropFile(c, file);
+    await until(async () => (await docKey(c)) !== key, { message: 'a document of its own' });
+    assert.ok((await toasts(c)).some((t) => t.includes('choose Reconnect')), (await toasts(c)).join(' | '));
   }, { reads: false }));
 
   test('where it can\'t, another project\'s file with the same name never joins the document', () => withDisk(async ({ open, live, otherFile }) => {
@@ -2158,6 +2168,56 @@ describe('leaving a page', () => {
 });
 
 describe('more on several tabs', () => {
+  const countWrites = (page) => page.evaluate(() => {
+    window.__writes = 0;
+    const orig = IDBDatabase.prototype.transaction;
+    IDBDatabase.prototype.transaction = function (names, mode) {
+      if (mode === 'readwrite' && [].concat(names).includes('docs')) window.__writes++;
+      return orig.call(this, names, mode);
+    };
+  });
+  const hide = (page) => page.evaluate(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); });
+
+  test('a tab whose storage fails partway keeps journaling, so closing it loses nothing', () => withApp({}, async ({ page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    await page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Saved.' }));
+    await sleep(300);
+    await page.evaluate(() => { IDBDatabase.prototype.transaction = function () { throw new DOMException('gone', 'UnknownError'); }; });
+    await page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'Status survives', comment: 'Only in memory.' }));
+    await sleep(300);
+    await page.evaluate(() => window.dispatchEvent(new Event('pagehide')));
+    const j = await page.evaluate(() => { const k = Object.keys(localStorage).find((x) => x.includes('.journal.')); return k && JSON.parse(localStorage.getItem(k)); });
+    assert.ok(j && j.comments.some((c) => c.body === 'Only in memory.'), 'the journal holds the comment');
+  }));
+
+  test('rapid changes coalesce into a few saves, and every one of them lands', () => withApp({}, async ({ page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    const key = await page.evaluate(() => window.__markdownAnnotator.state.doc.key);
+    await sleep(400);
+    await countWrites(page);
+    await page.evaluate(() => { for (let i = 0; i < 40; i++) window.markdownAnnotator.addComment({ quote: 'be conservative', comment: `n${i}` }); });
+    await until(async () => (await idbRecord(page, key)).comments.length === 40, { message: 'all 40 saved' });
+    const writes = await page.evaluate(() => window.__writes);
+    assert.ok(writes <= 5, `40 changes, ${writes} saves`);
+  }));
+
+  test('a tab that only took in another tab\'s changes writes nothing when it hides', () => withApp({}, async ({ ctx, page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    const b = await ctx.newPage();
+    await b.goto(appUrl);
+    await b.evaluate(() => window.markdownAnnotator.ready);
+    await until(() => b.evaluate(() => window.__markdownAnnotator.state.path === 'docs/PLAN.md'), { message: 'same document' });
+    await page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'From A.' }));
+    await until(async () => (await comments(b)).length === 1, { message: 'B took it in' });
+    await sleep(300);
+    await countWrites(b);
+    await hide(b);
+    await b.evaluate(() => window.dispatchEvent(new Event('pagehide')));
+    await sleep(300);
+    assert.equal(await b.evaluate(() => window.__writes), 0, 'no save');
+    assert.equal(await b.evaluate(() => Object.keys(localStorage).filter((k) => k.includes('.journal.')).length), 0, 'no journal');
+  }));
+
   test('a journal left by a closing tab reaches the other tab at once', async () => {
     // A well-formed comment, made in a separate context so it never reaches this one by a save.
     const other = await openApp(browser);

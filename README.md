@@ -90,9 +90,14 @@ isn't watching the file.
 A file chosen through the fallback file dialog, or pasted text, is a snapshot: it never reloads.
 
 On Chrome 153 and early 154 builds, a file is followed only in the tab that opened it: another tab, or a reload,
-shows the saved copy with **Reconnect**. Those builds crash the whole browser when an Incognito window reads a
-file's permission back from storage, and a page can't tell an Incognito window apart. Chrome 154.0.8037.95 and
-later don't need this.
+shows the saved copy with **Reconnect**, which picks the file again and carries on with the same review. Those
+builds crash the whole browser when an Incognito window reads a file's permission back from storage, and a page
+can't tell an Incognito window apart. Chrome 154.0.8037.95 and later don't need this (early 155 test builds,
+before 155.0.8059.12, do).
+
+Chrome 153 and 154 also crash the whole browser if a tab closes while it is storing a file's permission. The page
+stores it only at the moment you open or reconnect a file, never when saving or closing, so only closing the tab
+within a few hundredths of a second of opening a file can still hit it.
 
 ### Privacy
 
