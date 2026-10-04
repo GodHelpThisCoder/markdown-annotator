@@ -2100,6 +2100,40 @@ describe('several tabs on a file followed on disk', () => {
     assert.equal((await idbRecord(b, key)).text, PLAN, 'the first document keeps its text');
   }, { reads: false }));
 
+  test('a record a 1.0.0 tab wrote with its handle is left alone while the page is hidden, then moved', () => withDisk(async ({ open, live }) => {
+    const a = await open();
+    await live(a);
+    const key = await docKey(a);
+    await sleep(300);
+    // A 1.0.0 tab still open after the upgrade writes the handle into the record again.
+    await a.evaluate((k) => new Promise((res) => {
+      const h = window.__markdownAnnotator.state.doc.handle;
+      const q = indexedDB.open('markdown-annotator.v1');
+      q.onsuccess = () => {
+        const tx = q.result.transaction(['docs', 'meta'], 'readwrite');
+        const docs = tx.objectStore('docs');
+        const g = docs.get(k);
+        g.onsuccess = () => { const r = g.result; r.handle = h; docs.put(r); tx.objectStore('meta').delete(`handle:${k}`); };
+        tx.oncomplete = () => { q.result.close(); res(); };
+      };
+    }), key);
+    const setPath = (v) => a.evaluate((x) => { const el = document.querySelector('#path'); el.value = x; el.dispatchEvent(new Event('input')); }, v);
+    const show = (v) => a.evaluate((x) => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => x }); document.dispatchEvent(new Event('visibilitychange')); }, v);
+    await a.evaluate(() => Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }));
+    await setPath('docs/HIDDEN.md');
+    await show('hidden');
+    await sleep(400);
+    let rec = await idbRecord(a, key);
+    assert.equal(rec.handle, 'present', 'the record keeps its handle while hidden');
+    assert.equal(await a.evaluate(() => Object.keys(localStorage).filter((k) => k.includes('.journal.')).length), 1, 'the change is journaled');
+    await show('visible');
+    await setPath('docs/SHOWN.md');
+    await until(async () => (await idbRecord(a, key)).handle === null, { message: 'moved out once visible' });
+    rec = await idbRecord(a, key);
+    assert.equal(rec.path, 'docs/SHOWN.md');
+    await until(async () => (await a.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`), { message: 'handed on to its own entry' });
+  }));
+
   test('a handle entry outlives its record while Forget can still be undone, then goes', () => withDisk(async ({ open, live }) => {
     const a = await open();
     await live(a);

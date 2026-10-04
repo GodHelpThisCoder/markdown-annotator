@@ -51,7 +51,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Er81E07nyGdaYb5FZ+ZJc31ZT1QNc5MYZvVfhCqgl2o=' 'sha256-xFxWhH7/tfobFEIavwyFLZQVKASH7h/i9W6KS2XiTK8='; style-src 'unsafe-inline'; img-src * data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Er81E07nyGdaYb5FZ+ZJc31ZT1QNc5MYZvVfhCqgl2o=' 'sha256-hi0UQtGvdspy0ZQhC+/rTlx0vlBaabfU0UNbGSOPHAg='; style-src 'unsafe-inline'; img-src * data: blob:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0e1013">
 <title>Markdown Annotator</title>
@@ -1531,6 +1531,10 @@ textarea.field { min-height: 4.6em; max-height: 40vh; resize: vertical; }
         get.onsuccess = () => {
           try {
             const prev = get.result || null;
+            // A record a 1.0.0 tab wrote still holds its handle. While this page is hidden (it may be closing),
+            // neither write that handle nor drop it: the save stands down, the journal keeps the changes, and
+            // a visible tab moves the handle.
+            if (prev && prev.handle && document.visibilityState === 'hidden') throw Object.assign(new Error('handle record while hidden'), { name: 'HandleLater' });
             out = bare(fn(prev));
             if (out) s.put(out);
             if (out && prev && prev.handle) handedOn(key, prev.handle);
@@ -1556,7 +1560,7 @@ textarea.field { min-height: 4.6em; max-height: 40vh; resize: vertical; }
     async function attempt(dbFn, memFn) {
       if (memOnly) return memFn();
       try { return await dbFn(); } catch (e) {
-        if (e && e.name === 'DataCloneError') throw e;
+        if (e && (e.name === 'DataCloneError' || e.name === 'HandleLater')) throw e;
         console.warn('[markdown-annotator] IndexedDB unavailable; keeping data in memory for this tab', e);
         memOnly = true;
         onStorageLost();
@@ -1656,7 +1660,7 @@ textarea.field { min-height: 4.6em; max-height: 40vh; resize: vertical; }
       forgotAt = (await store.getMeta('forgotAt')) || 0;
       moved = !!(await store.getMeta('handlesMoved'));
     } catch { return; }
-    if (!moved && store.durable()) {
+    if (!moved && store.durable() && document.visibilityState === 'visible') {
       let recs = [];
       let ok = true;
       try { recs = await store.all(); } catch { recs = []; ok = false; }

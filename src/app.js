@@ -376,6 +376,10 @@
         get.onsuccess = () => {
           try {
             const prev = get.result || null;
+            // A record a 1.0.0 tab wrote still holds its handle. While this page is hidden (it may be closing),
+            // neither write that handle nor drop it: the save stands down, the journal keeps the changes, and
+            // a visible tab moves the handle.
+            if (prev && prev.handle && document.visibilityState === 'hidden') throw Object.assign(new Error('handle record while hidden'), { name: 'HandleLater' });
             out = bare(fn(prev));
             if (out) s.put(out);
             if (out && prev && prev.handle) handedOn(key, prev.handle);
@@ -401,7 +405,7 @@
     async function attempt(dbFn, memFn) {
       if (memOnly) return memFn();
       try { return await dbFn(); } catch (e) {
-        if (e && e.name === 'DataCloneError') throw e;
+        if (e && (e.name === 'DataCloneError' || e.name === 'HandleLater')) throw e;
         console.warn('[markdown-annotator] IndexedDB unavailable; keeping data in memory for this tab', e);
         memOnly = true;
         onStorageLost();
@@ -501,7 +505,7 @@
       forgotAt = (await store.getMeta('forgotAt')) || 0;
       moved = !!(await store.getMeta('handlesMoved'));
     } catch { return; }
-    if (!moved && store.durable()) {
+    if (!moved && store.durable() && document.visibilityState === 'visible') {
       let recs = [];
       let ok = true;
       try { recs = await store.all(); } catch { recs = []; ok = false; }
