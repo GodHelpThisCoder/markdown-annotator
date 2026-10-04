@@ -430,6 +430,8 @@
   const handleKey = (key) => 'handle:' + key;
   const isLive = (r) => !!(r && (r.live || r.handle));
   let handleReadsSafe = true;
+  // The one routine write of a handle, when a file is opened or reconnected: a tab closed within those few
+  // milliseconds could still meet the Chrome crash, but no save, sync or close writes one.
   function keepHandle(key, handle) {
     if (!handle || handles.get(key) === handle) return;
     handles.set(key, handle);
@@ -467,16 +469,21 @@
   }
   // Before 1.0.1 each record carried its file handle: move any such handle to its own entry, once, and drop
   // handle entries whose record is gone (keys are listed first, so a document opened meanwhile keeps its own).
+  // Reading a 1.0.0 record reads its handle too, whatever the version check says: there is no other way to
+  // reach it, and an Incognito window could only hold one if 1.0.0 ran there in the same session.
   async function tidyHandles() {
     let keys = [];
     let recs = [];
-    try { keys = await store.metaKeys(); recs = await store.all(); } catch { return; }
+    let forgotAt = 0;
+    try { keys = await store.metaKeys(); recs = await store.all(); forgotAt = (await store.getMeta('forgotAt')) || 0; } catch { return; }
     const known = new Set(recs.map((r) => r.key));
     for (const r of recs) {
       if (!r.handle) continue;
       try { await store.setMeta(handleKey(r.key), r.handle); } catch { continue; }
       try { await store.update(r.key, (cur) => (cur ? { ...cur, live: true } : null)); } catch { /* next start */ }
     }
+    // A document forgotten in the last minute may still come back with Undo, so its handle stays.
+    if (forgotAt > now() - 60000) return;
     for (const k of keys) if (typeof k === 'string' && k.startsWith('handle:') && !known.has(k.slice(7))) store.delMeta(k);
   }
 
@@ -627,9 +634,11 @@
   }
 
   // What a save writes, in brief: a page being hidden saves only when this differs from the last save.
-  const saveSig = () => (state.doc ? [state.doc.key, state.loadedAt, state.generalAt, !!state.generalSent, state.generalSentAt || 0,
-    state.pathAt, !!state.doc.copy, !!(state.doc.handle || state.doc.live), Object.keys(state.deleted).length,
-    state.lastBatch ? JSON.stringify(state.lastBatch).length : 0, state.comments.map((c) => `${c.id}:${c.updated || 0}`).join(',')].join('|') : '');
+  // Values as well as times, since two changes can share a millisecond (comments can't: touch() moves on).
+  const saveSig = () => (state.doc ? [state.doc.key, state.loadedAt, state.doc.text.length, hash(state.general), state.generalAt,
+    !!state.generalSent, state.generalSentAt || 0, state.path, state.pathAt, !!state.doc.copy, !!(state.doc.handle || state.doc.live),
+    Object.keys(state.deleted).length, state.lastBatch ? JSON.stringify(state.lastBatch).length : 0,
+    state.comments.map((c) => `${c.id}:${c.updated || 0}`).join(',')].join('|') : '');
   let savedSig = '';
   const dirty = () => !!state.doc && (saveSoon.pending() || saveSig() !== savedSig);
 
@@ -639,6 +648,7 @@
     if (!state.doc) return saving;
     const doc = state.doc;
     const sig = saveSig();
+    const seq = ++journalSeq;
     const local = serialize();
     saving = saving.then(async () => {
       let merged = null;
@@ -647,7 +657,7 @@
         if (state.doc === doc) savedSig = sig;
         // A journal this tab wrote before this save is covered now.
         const j = lsGet(journalKey(local.key), null);
-        if (j && (j.at || 0) <= local.updatedAt) lsSet(journalKey(local.key), null);
+        if (j && (j.seq || 0) < seq) lsSet(journalKey(local.key), null);
       }
       if (merged && state.doc === doc) adoptMerged(merged);
       if (state.doc && state.doc.key === local.key && !closing) {
@@ -664,10 +674,11 @@
   // An IndexedDB write started during unload may never commit; a synchronous journal covers that gap. Each
   // tab writes its own, and another open tab merges it at once (the storage event), or the next start does.
   const journalKey = (key) => `${NS}.journal.${TAB_ID}.${key}`;
+  let journalSeq = 0; // orders this tab's journals and saves, which a timestamp can't within a millisecond
   function writeJournal() {
     if (!state.doc) return;
     lsSet(journalKey(state.doc.key), {
-      key: state.doc.key, at: now(), comments: state.comments.map(persistedComment), deleted: state.deleted,
+      key: state.doc.key, at: now(), seq: ++journalSeq, comments: state.comments.map(persistedComment), deleted: state.deleted,
       general: state.general, generalAt: state.generalAt, generalSent: state.generalSent, generalSentAt: state.generalSentAt || 0,
       path: state.path, pathAt: state.pathAt,
     });
@@ -678,13 +689,17 @@
     try { keys = Object.keys(localStorage).filter((k) => k.startsWith(`${NS}.journal.`)); } catch { return []; }
     const done = new Set();
     for (const k of keys) {
-      const j = lsGet(k, null);
-      lsSet(k, null);
-      if (!j || !j.key || !Array.isArray(j.comments)) continue;
+      let raw = null;
+      try { raw = localStorage.getItem(k); } catch { continue; }
+      let j = null;
+      try { j = JSON.parse(raw); } catch { j = null; }
+      if (!j || !j.key || !Array.isArray(j.comments)) { lsSet(k, null); continue; }
       try {
         await store.update(j.key, (stored) => (stored ? mergeRecords({ ...stored, ...j, text: stored.text, loadedAt: stored.loadedAt, lastModified: stored.lastModified, size: stored.size }, stored) : null));
-        done.add(j.key);
-      } catch { /* ignore */ }
+      } catch { continue; } // kept for the next try
+      done.add(j.key);
+      // Removed once merged, unless its tab wrote a newer one meanwhile.
+      try { if (localStorage.getItem(k) === raw) localStorage.removeItem(k); } catch { /* ignore */ }
     }
     return [...done];
   }
@@ -1396,11 +1411,10 @@
         if (!h) continue;
         try { if (await h.isSameEntry(handle)) return { rec: r, taken: true }; } catch { /* stale handle */ }
       }
-      // A followed document whose handle this tab can't read (see handleFor) takes its file back from
-      // Reconnect, while it is the open document, or when the file still has the same text.
+      // A followed document whose handle this tab can't read (see handleFor) takes a file back only from its
+      // own Reconnect, or when the file has exactly the saved text: another project's PLAN.md never joins it.
       const unknown = all.filter((r) => isLive(r) && !handles.has(r.key));
-      const again = unknown.find((r) => r.key === reconnectKey) || unknown.find((r) => state.doc && r.key === state.doc.key)
-        || unknown.find((r) => text != null && r.text === text);
+      const again = unknown.find((r) => r.key === reconnectKey) || unknown.find((r) => text != null && r.text === text);
       if (again) return { rec: again, taken: true };
     }
     // A link or a script names the file by its path: it joins the record for that path, even one the
@@ -1730,6 +1744,7 @@
 
   async function forget(rec) {
     const full = (await store.get(rec.key)) || rec;
+    store.setMeta('forgotAt', now()); // keeps its file handle through Undo (see tidyHandles)
     await store.del(rec.key);
     showEmpty();
     toast(`Forgot ${rec.name}.`, { action: 'Undo', ms: 6000, onAction: async () => { await store.put(full); showEmpty(); } });
@@ -1737,6 +1752,7 @@
   async function forgetAll() {
     const all = await store.all();
     if (!all.length) return;
+    store.setMeta('forgotAt', now());
     await store.clear();
     showEmpty();
     toast(`Forgot ${plural(all.length, 'document')} and their comments.`, {
@@ -3543,6 +3559,7 @@
     records: () => store.all(),
     metaKeys: () => store.metaKeys(),
     get handleReadsSafe() { return handleReadsSafe; },
+    checkHandleReads: () => checkHandleReads(),
     applyUpdate: (text) => applyUpdate(normalizeSource(text)),
     copy: (opts) => copyReview(opts),
     selectText(exact, nth = 0) {

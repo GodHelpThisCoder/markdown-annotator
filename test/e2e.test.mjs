@@ -1982,6 +1982,9 @@ describe('several tabs on a file followed on disk', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ma-disk-'));
     const file = join(dir, 'PLAN.md');
     writeFileSync(file, PLAN);
+    mkdirSync(join(dir, 'other'));
+    const otherFile = join(dir, 'other', 'PLAN.md');
+    writeFileSync(otherFile, '# Plan\n\nAnother project\'s plan.\n');
     const app = await launchProfile();
     try {
       if (typeof reads === 'boolean') await app.ctx.addInitScript((v) => { window.__markdownAnnotatorHandleReads = v; }, reads);
@@ -1996,7 +1999,7 @@ describe('several tabs on a file followed on disk', () => {
         await dropFile(page, file);
         await until(() => page.evaluate(() => window.__markdownAnnotator.state.liveMode === 'on'), { message: 'following the file' });
       };
-      await fn({ ...app, file, open, live });
+      await fn({ ...app, file, otherFile, open, live });
     } finally {
       await app.close();
       rmSync(dir, { recursive: true, force: true });
@@ -2073,6 +2076,41 @@ describe('several tabs on a file followed on disk', () => {
     assert.equal(await docKey(b), key, 'the same document, not a new one');
     assert.equal((await comments(b)).length, 1);
   }, { reads: false }));
+
+  test('where it can\'t, another project\'s file with the same name never joins the document', () => withDisk(async ({ open, live, otherFile }) => {
+    const a = await open();
+    await live(a);
+    await a.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Why?' }));
+    const key = await docKey(a);
+    const b = await open();
+    await until(() => b.evaluate(() => window.__markdownAnnotator.state.liveMode === 'perm'), { message: 'Reconnect offered' });
+    await dropFile(b, otherFile);
+    await until(async () => (await docKey(b)) !== key, { message: 'the other file opened' });
+    assert.equal((await comments(b)).length, 0, 'none of the first document\'s comments');
+    assert.equal((await idbRecord(b, key)).text, PLAN, 'the first document keeps its text');
+  }, { reads: false }));
+
+  test('a handle entry outlives its record while Forget can still be undone, then goes', () => withDisk(async ({ open, live }) => {
+    const a = await open();
+    await live(a);
+    const key = await docKey(a);
+    // Forget, as the start screen does: the record goes, and the time is noted.
+    const forget = (at) => a.evaluate(({ k, t }) => new Promise((res) => {
+      const q = indexedDB.open('markdown-annotator.v1');
+      q.onsuccess = () => {
+        const tx = q.result.transaction(['docs', 'meta'], 'readwrite');
+        tx.objectStore('docs').delete(k);
+        tx.objectStore('meta').put({ k: 'forgotAt', v: t });
+        tx.oncomplete = () => { q.result.close(); res(); };
+      };
+    }), { k: key, t: at });
+    await forget(Date.now());
+    const b = await open(); // its start tidies handle entries
+    assert.ok((await b.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`), 'kept for Undo');
+    await forget(Date.now() - 120000);
+    const c = await open();
+    await until(async () => !(await c.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`), { message: 'removed later' });
+  }));
 });
 
 describe('leaving a page', () => {
@@ -2116,5 +2154,51 @@ describe('leaving a page', () => {
     await page.close({ runBeforeUnload: true });
     await until(() => b.evaluate(() => window.__markdownAnnotator.state.path === 'docs/MOVED.md'), { message: 'the change reached the other tab' });
     await until(async () => (await journals(b)) === 0, { message: 'no journal left behind' });
+  }));
+});
+
+describe('more on several tabs', () => {
+  test('a journal left by a closing tab reaches the other tab at once', async () => {
+    // A well-formed comment, made in a separate context so it never reaches this one by a save.
+    const other = await openApp(browser);
+    let made;
+    try {
+      await other.page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+      await other.page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'From the journal.' }));
+      made = await other.page.evaluate(() => window.__markdownAnnotator.state.comments.map((c) => ({ ...c, range: undefined }))[0]);
+    } finally { await other.ctx.close(); }
+    await withApp({}, async ({ ctx, page }) => {
+      await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+      const key = await page.evaluate(() => window.__markdownAnnotator.state.doc.key);
+      const b = await ctx.newPage();
+      await b.goto(appUrl);
+      await b.evaluate(() => window.markdownAnnotator.ready);
+      await until(() => b.evaluate((k) => window.__markdownAnnotator.state.doc && window.__markdownAnnotator.state.doc.key === k, key), { message: 'same document' });
+      // What a closing tab leaves when its last save didn't finish.
+      await page.evaluate(({ k, c }) => localStorage.setItem(`markdown-annotator.v1.journal.gone.${k}`, JSON.stringify({
+        key: k, at: Date.now(), seq: 1, comments: [c], deleted: {}, general: '', generalAt: 0, generalSent: false, generalSentAt: 0, path: '', pathAt: 0,
+      })), { k: key, c: made });
+      await until(async () => (await comments(b)).some((c) => c.body === 'From the journal.'), { message: 'merged into the other tab' });
+      await until(() => b.evaluate(() => !Object.keys(localStorage).some((k) => k.includes('.journal.'))), { message: 'journal removed once merged' });
+      assert.equal((await idbRecord(b, key)).comments.length, 1, 'and saved');
+    });
+  });
+
+  test('the Chrome versions that can\'t read a file handle back are recognised', () => withApp({}, async ({ page }) => {
+    const check = (v) => page.evaluate(async (ver) => {
+      Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => ({ getHighEntropyValues: async () => ({ fullVersionList: [{ brand: 'Chromium', version: ver }] }) }) });
+      await window.__markdownAnnotator.checkHandleReads();
+      return window.__markdownAnnotator.handleReadsSafe;
+    }, v);
+    const cases = { '152.0.7977.0': true, '153.0.8010.53': false, '154.0.8037.57': false, '154.0.8037.95': true, '155.0.8059.11': false, '155.0.8059.12': true, '156.0.8100.0': true };
+    for (const [v, safe] of Object.entries(cases)) assert.equal(await check(v), safe, v);
+    // Without the full version, only the major number: 154 counts as unsafe.
+    const reduced = await page.evaluate(async () => {
+      Object.defineProperty(Navigator.prototype, 'userAgentData', { configurable: true, get: () => undefined });
+      Object.defineProperty(Navigator.prototype, 'userAgent', { configurable: true, get: () => 'Mozilla/5.0 Chrome/154.0.0.0 Safari/537.36' });
+      await window.__markdownAnnotator.checkHandleReads();
+      return window.__markdownAnnotator.handleReadsSafe;
+    });
+    assert.equal(reduced, false);
   }));
 });

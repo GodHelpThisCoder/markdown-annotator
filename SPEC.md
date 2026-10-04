@@ -281,7 +281,8 @@ returns to the comment's note.
 - Chrome 153 and early 154 builds (before 154.0.8037.95) crash the whole browser when an Incognito or Guest
   window reads a file handle back from IndexedDB (crbug 562119515), and a page can't tell those windows apart.
   On those builds a document follows its file only in the tab that opened it; another tab or a reload shows
-  the saved copy with Reconnect, and picking or dropping the same file there rejoins the same document.
+  the saved copy with Reconnect. A file picked through Reconnect, or a dropped or opened file whose text is exactly
+  the saved text, rejoins the same document; another file with the same name opens as its own.
 - The start screen lists up to 8 recent documents, with their comment counts. Opening one asks for permission
   inside the click.
 - Other tabs showing the same document merge its saved comments in through `BroadcastChannel`. A tab with its
