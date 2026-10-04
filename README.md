@@ -96,8 +96,8 @@ can't tell an Incognito window apart. Chrome 154.0.8037.95 and later don't need 
 before 155.0.8059.12, do).
 
 Chrome 153 and 154 also crash the whole browser if a tab closes while it is storing a file's permission. The page
-stores it only at the moment you open or reconnect a file, never when saving or closing, so only closing the tab
-within a few hundredths of a second of opening a file can still hit it.
+stores it only at the moment you open or reconnect a file (and once when it upgrades data from version 1.0.0),
+never when saving or closing, so only closing the tab within a few hundredths of a second of that can still hit it.
 
 ### Privacy
 

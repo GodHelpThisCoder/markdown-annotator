@@ -333,6 +333,8 @@
     // while an IndexedDB write holding one is in flight, and every save writes the record, so handles are
     // kept apart in meta (see handleFor) and only written when a file is opened.
     const bare = (r) => { if (!r || !('handle' in r)) return r; const { handle, ...rest } = r; return rest; };
+    // A handle found in a record (one a 1.0.0 tab wrote) is kept apart rather than dropped (see keepHandle).
+    const handedOn = (key, handle) => { try { keepHandle(key, handle); } catch { /* not yet set up */ } };
     let memOnly = typeof indexedDB === 'undefined';
     function open() {
       if (!dbp) {
@@ -373,8 +375,10 @@
         const get = s.get(key);
         get.onsuccess = () => {
           try {
-            out = bare(fn(get.result || null));
+            const prev = get.result || null;
+            out = bare(fn(prev));
             if (out) s.put(out);
+            if (out && prev && prev.handle) handedOn(key, prev.handle);
           } catch (e) { failure = e; tx.abort(); }
         };
         tx.oncomplete = () => resolve(out);
@@ -435,7 +439,7 @@
   let handleReadsSafe = true;
   // The one routine write of a handle, when a file is opened or reconnected: a tab closed within those few
   // milliseconds could still meet the Chrome crash, but no save, sync or close writes one.
-  let handleLater = null; // one that arrived while the page was hidden (it may be closing): written once it shows
+  const handlesLater = new Map(); // ones that arrived while the page was hidden (it may be closing): written once it shows
   function writeHandle(key, handle) {
     // A handle that can't be stored still lets this tab follow the file.
     Promise.resolve(store.setMeta(handleKey(key), handle)).catch(() => {});
@@ -443,14 +447,13 @@
   function keepHandle(key, handle) {
     if (!handle || handles.get(key) === handle) return;
     handles.set(key, handle);
-    if (document.visibilityState === 'hidden') { handleLater = { key, handle }; return; }
+    if (document.visibilityState === 'hidden') { handlesLater.set(key, handle); return; }
     writeHandle(key, handle);
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible' || !handleLater) return;
-    const { key, handle } = handleLater;
-    handleLater = null;
-    if (handles.get(key) === handle) writeHandle(key, handle);
+    if (document.visibilityState !== 'visible') return;
+    for (const [key, handle] of handlesLater) if (handles.get(key) === handle) writeHandle(key, handle);
+    handlesLater.clear();
   });
   async function handleFor(key) {
     if (handles.has(key)) return handles.get(key);
@@ -485,7 +488,8 @@
   // Before 1.0.1 each record carried its file handle: move any such handle to its own entry, once, and drop
   // handle entries whose record is gone (keys are listed first, so a document opened meanwhile keeps its own).
   // Reading a 1.0.0 record reads its handle too, whatever the version check says: there is no other way to
-  // reach it, and an Incognito window could only hold one if 1.0.0 ran there in the same session.
+  // reach it. An Incognito window can't hold one, though: 1.0.0 read every record back right after storing a
+  // handle (pruning), which on the affected builds crashed the browser and so ended that Incognito session.
   async function tidyHandles() {
     let keys = [];
     let docKeys = [];
@@ -633,8 +637,8 @@
     const incoming = new Set();
     const next = [];
     for (const c of m.comments) {
-      incoming.add(c.id);
       if (deleted[c.id] >= (c.updated || 0)) continue; // an older save's merge can still hold one deleted since
+      incoming.add(c.id);
       const l = local.get(c.id);
       if (l && (l.updated || 0) >= (c.updated || 0)) next.push(l);
       else { const copy = { ...c }; if (state.index) anchor(copy); next.push(copy); changed = true; }
@@ -736,6 +740,7 @@
         await store.update(j.key, (stored) => (stored ? mergeRecords({ ...stored, ...j, text: stored.text, loadedAt: stored.loadedAt, lastModified: stored.lastModified, size: stored.size }, stored) : null));
       } catch { continue; } // kept for the next try
       done.add(j.key);
+      if (!store.durable()) continue; // merged into memory only: keep it for a start that has IndexedDB
       // Removed once merged, unless its tab wrote a newer one meanwhile.
       try { if (localStorage.getItem(k) === raw) localStorage.removeItem(k); } catch { /* ignore */ }
     }
@@ -771,10 +776,11 @@
     state.syncPending = false;
     const rec = await store.get(state.doc.key);
     if (!rec || !state.doc || rec.key !== state.doc.key) return;
-    // Nothing of this tab's own unsaved: taking in what is stored leaves it clean, so closing it saves nothing.
+    // Nothing of this tab's own unsaved: taking in what is stored leaves it clean, so closing it saves nothing,
+    // unless taking it in made changes of its own (newer text archives sent comments), which then save.
     const clean = saveJobs === 0 && !dirty() && store.durable();
     adoptMerged(mergeRecords(serialize(), rec));
-    if (clean) savedSig = saveSig();
+    if (clean && saveJobs === 0 && !saveSoon.pending()) savedSig = saveSig();
   }
   // The start screen's list follows other tabs' saves, at most every 250 ms and only while it shows.
   const refreshEmpty = debounce(() => { if (!state.doc && !dom.empty.hidden && document.visibilityState === 'visible') showEmpty(); }, 250);
@@ -1729,7 +1735,8 @@
     await saveNow();
     await cleared;
     closing = false;
-    if (key) lsSet(journalKey(key), null);
+    if (key && store.durable()) lsSet(journalKey(key), null);
+    else if (key) writeJournal(); // IndexedDB failed: the journal is the only lasting copy
     state.doc = null;
     state.comments = [];
     state.deleted = {};

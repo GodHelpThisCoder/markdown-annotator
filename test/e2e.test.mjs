@@ -2178,6 +2178,22 @@ describe('more on several tabs', () => {
   });
   const hide = (page) => page.evaluate(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); });
 
+  test('a journal another tab could merge only into memory is kept for a start that has IndexedDB', () => withApp({}, async ({ ctx, page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    const key = await page.evaluate(() => window.__markdownAnnotator.state.doc.key);
+    const b = await ctx.newPage();
+    await b.goto(appUrl);
+    await b.evaluate(() => window.markdownAnnotator.ready);
+    await until(() => b.evaluate((k) => window.__markdownAnnotator.state.doc && window.__markdownAnnotator.state.doc.key === k, key), { message: 'same document' });
+    await b.evaluate(() => { IDBDatabase.prototype.transaction = function () { throw new DOMException('gone', 'UnknownError'); }; });
+    const jk = `markdown-annotator.v1.journal.gone.${key}`;
+    await page.evaluate(({ k, j }) => localStorage.setItem(j, JSON.stringify({
+      key: k, at: Date.now(), seq: 1, comments: [], deleted: {}, general: 'From the journal.', generalAt: Date.now(), generalSent: false, generalSentAt: 0, path: '', pathAt: 0,
+    })), { k: key, j: jk });
+    await sleep(800);
+    assert.ok(await page.evaluate((j) => localStorage.getItem(j) !== null, jk), 'the journal is still there');
+  }));
+
   test('a tab whose storage fails partway keeps journaling, so closing it loses nothing', () => withApp({}, async ({ page }) => {
     await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
     await page.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Saved.' }));
@@ -2250,7 +2266,10 @@ describe('more on several tabs', () => {
       await window.__markdownAnnotator.checkHandleReads();
       return window.__markdownAnnotator.handleReadsSafe;
     }, v);
-    const cases = { '152.0.7977.0': true, '153.0.8010.53': false, '154.0.8037.57': false, '154.0.8037.95': true, '155.0.8059.11': false, '155.0.8059.12': true, '156.0.8100.0': true };
+    const cases = {
+      '152.0.7977.0': true, '153.0.8010.53': false, '154.0.8037.57': false, '154.0.8037.95': true,
+      '155.0.8050.0': false, '155.0.8059.11': false, '155.0.8059.12': true, '156.0.8100.0': true,
+    };
     for (const [v, safe] of Object.entries(cases)) assert.equal(await check(v), safe, v);
     // Without the full version, only the major number: 154 counts as unsafe.
     const reduced = await page.evaluate(async () => {
@@ -2260,5 +2279,11 @@ describe('more on several tabs', () => {
       return window.__markdownAnnotator.handleReadsSafe;
     });
     assert.equal(reduced, false);
+    const reduced155 = await page.evaluate(async () => {
+      Object.defineProperty(Navigator.prototype, 'userAgent', { configurable: true, get: () => 'Mozilla/5.0 Chrome/155.0.0.0 Safari/537.36' });
+      await window.__markdownAnnotator.checkHandleReads();
+      return window.__markdownAnnotator.handleReadsSafe;
+    });
+    assert.equal(reduced155, true, 'a 155 stable build');
   }));
 });
