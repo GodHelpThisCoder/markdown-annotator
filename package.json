@@ -1,6 +1,6 @@
 {
   "name": "markdown-annotator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Single-file Markdown annotator: highlight passages, comment, copy one consolidated review for an AI coding agent",
   "repository": {
     "type": "git",

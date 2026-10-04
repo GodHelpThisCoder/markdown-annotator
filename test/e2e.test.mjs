@@ -3,11 +3,13 @@
 // Uses playwright-core with the locally installed Chrome, headless. One browser, a fresh context per test.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   launch, openApp, openText, selectText, output, comments, visible, toasts, clips, addComment,
-  rectsOf, scrollToText, until, sleep, idbRecord, appUrl, PLAN, EDGE,
+  rectsOf, scrollToText, until, sleep, idbRecord, appUrl, PLAN, EDGE, launchProfile, dropFile,
 } from './helpers.mjs';
 
 let browser;
@@ -1969,5 +1971,150 @@ describe('theme', () => {
     await page.emulateMedia({ colorScheme: 'dark' });
     await page.evaluate(() => { window.__markdownAnnotator.settings.theme = 'light'; document.documentElement.dataset.theme = 'light'; });
     assert.equal(await bg(page), 'rgb(255, 255, 255)', 'Light wins over a dark OS');
+  }));
+});
+
+// Chrome 153 and 154 crash the whole browser when a tab closes while an IndexedDB write holding a file handle
+// is in flight, so records never hold one (see the store in src/app.js). These tests use real files on disk
+// in an ordinary Chrome profile, the setup where that crash shows up.
+describe('several tabs on a file followed on disk', () => {
+  async function withDisk(fn, { reads } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ma-disk-'));
+    const file = join(dir, 'PLAN.md');
+    writeFileSync(file, PLAN);
+    const app = await launchProfile();
+    try {
+      if (typeof reads === 'boolean') await app.ctx.addInitScript((v) => { window.__markdownAnnotatorHandleReads = v; }, reads);
+      const open = async () => {
+        const page = await app.ctx.newPage();
+        page.setDefaultTimeout(8000);
+        await page.goto(appUrl);
+        await page.evaluate(() => window.markdownAnnotator.ready);
+        return page;
+      };
+      const live = async (page) => {
+        await dropFile(page, file);
+        await until(() => page.evaluate(() => window.__markdownAnnotator.state.liveMode === 'on'), { message: 'following the file' });
+      };
+      await fn({ ...app, file, open, live });
+    } finally {
+      await app.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const docKey = (page) => page.evaluate(() => window.__markdownAnnotator.state.doc && window.__markdownAnnotator.state.doc.key);
+
+  test('closing tabs on a followed file never takes Chrome down, and every comment survives', () => withDisk(async ({ crashed, open, live }) => {
+    let a = await open();
+    await live(a);
+    for (let i = 0; i < 12; i++) {
+      const b = await open();
+      await until(() => docKey(b), { message: 'the new tab restored the document' });
+      // A change just before closing, so the tab leaves with a save in flight: the worst case.
+      await a.evaluate((n) => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: `Round ${n}` }), i);
+      await a.close();
+      await sleep(1000);
+      assert.ok(!crashed(), `Chrome crashed after closing tab ${i + 1}`);
+      a = b;
+      if (!(await a.evaluate(() => !!window.__markdownAnnotator.state.doc.handle))) await live(a);
+    }
+    await until(async () => (await comments(a)).length === 12, { message: 'all 12 comments in the last tab' });
+  }));
+
+  test('no saved record holds a file handle; one saved by 1.0.0 is moved out on the next start', () => withDisk(async ({ open, live }) => {
+    const a = await open();
+    await live(a);
+    await a.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Why?' }));
+    const key = await docKey(a);
+    await sleep(300);
+    const recs = await idbRecord(a);
+    assert.ok(recs.length && recs.every((r) => r.handle === null), 'no record holds a handle');
+    assert.equal(recs.find((r) => r.key === key).live, true);
+    assert.ok((await a.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`));
+    // What 1.0.0 stored: the handle inside the record, and no separate entry.
+    await a.evaluate((k) => new Promise((res) => {
+      const h = window.__markdownAnnotator.state.doc.handle;
+      const q = indexedDB.open('markdown-annotator.v1');
+      q.onsuccess = () => {
+        const tx = q.result.transaction(['docs', 'meta'], 'readwrite');
+        const docs = tx.objectStore('docs');
+        const g = docs.get(k);
+        g.onsuccess = () => { const r = g.result; delete r.live; r.handle = h; docs.put(r); tx.objectStore('meta').delete(`handle:${k}`); };
+        tx.oncomplete = () => { q.result.close(); res(); };
+      };
+    }), key);
+    await a.reload();
+    await a.evaluate(() => window.markdownAnnotator.ready);
+    const rec = await idbRecord(a, key);
+    assert.equal(rec.handle, null, 'moved out of the record');
+    assert.equal(rec.live, true);
+    assert.ok((await a.evaluate(() => window.__markdownAnnotator.metaKeys())).includes(`handle:${key}`));
+    assert.equal((await comments(a)).length, 1);
+  }));
+
+  test('where Chrome can read handles back, a second tab follows the file too', () => withDisk(async ({ open, live }) => {
+    const a = await open();
+    await live(a);
+    const b = await open();
+    await until(() => b.evaluate(() => window.__markdownAnnotator.state.liveMode === 'on'), { message: 'the second tab follows the file' });
+    assert.equal(await docKey(b), await docKey(a));
+  }, { reads: true }));
+
+  test('where it can\'t, a second tab offers Reconnect, and the same file dropped there rejoins the document', () => withDisk(async ({ open, live }) => {
+    const a = await open();
+    await live(a);
+    await a.evaluate(() => window.markdownAnnotator.addComment({ quote: 'be conservative', comment: 'Why?' }));
+    const key = await docKey(a);
+    const b = await open();
+    await until(() => b.evaluate(() => window.__markdownAnnotator.state.liveMode === 'perm'), { message: 'Reconnect offered' });
+    assert.equal(await b.evaluate(() => !!window.__markdownAnnotator.state.doc.handle), false);
+    assert.ok(await visible(b, '#btn-reconnect'));
+    await live(b);
+    assert.equal(await docKey(b), key, 'the same document, not a new one');
+    assert.equal((await comments(b)).length, 1);
+  }, { reads: false }));
+});
+
+describe('leaving a page', () => {
+  const setPath = (page, v) => page.evaluate((x) => { const el = document.querySelector('#path'); el.value = x; el.dispatchEvent(new Event('input')); }, v);
+  const journals = (page) => page.evaluate(() => Object.keys(localStorage).filter((k) => k.includes('.journal.')).length);
+
+  test('pagehide starts no IndexedDB work, and a hidden page saves only what changed', () => withApp({}, async ({ page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    await sleep(400);
+    await page.evaluate(() => {
+      window.__tx = 0;
+      const orig = IDBDatabase.prototype.transaction;
+      IDBDatabase.prototype.transaction = function (...a) { window.__tx++; return orig.apply(this, a); };
+    });
+    const tx = () => page.evaluate(() => window.__tx);
+    const show = (v) => page.evaluate((s) => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => s }); document.dispatchEvent(new Event('visibilitychange')); }, v);
+    await show('hidden');
+    await page.evaluate(() => window.dispatchEvent(new Event('pagehide')));
+    await sleep(200);
+    assert.equal(await tx(), 0, 'nothing changed, nothing written');
+    assert.equal(await journals(page), 0);
+    await show('visible');
+    // An unsaved change (the path field saves after a pause), then pagehide alone: only the journal.
+    await setPath(page, 'docs/OTHER.md');
+    await page.evaluate(() => window.dispatchEvent(new Event('pagehide')));
+    assert.equal(await tx(), 0, 'pagehide only journals');
+    assert.equal(await journals(page), 1);
+    await show('hidden');
+    await until(async () => (await tx()) > 0, { message: 'the hidden page saved' });
+    await until(async () => (await journals(page)) === 0, { message: 'the journal cleared once saved' });
+    await show('visible');
+  }));
+
+  test('a tab closed right after a change hands it to the other tab', () => withApp({}, async ({ ctx, page }) => {
+    await page.evaluate((t) => window.markdownAnnotator.open({ text: t, path: 'docs/PLAN.md' }), PLAN);
+    const b = await ctx.newPage();
+    await b.goto(appUrl);
+    await b.evaluate(() => window.markdownAnnotator.ready);
+    await until(() => b.evaluate(() => window.__markdownAnnotator.state.path === 'docs/PLAN.md'), { message: 'the second tab shows it' });
+    await setPath(page, 'docs/MOVED.md');
+    await page.close({ runBeforeUnload: true });
+    await until(() => b.evaluate(() => window.__markdownAnnotator.state.path === 'docs/MOVED.md'), { message: 'the change reached the other tab' });
+    await until(async () => (await journals(b)) === 0, { message: 'no journal left behind' });
   }));
 });

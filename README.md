@@ -69,7 +69,8 @@ folder. If the name is ambiguous, set **File path in the review** in the Review 
 | `Ctrl/⌘+O` | Open a file |
 | `?` | All shortcuts |
 
-Two tabs on the same document stay in sync, and neither overwrites the other's comments. Without a mouse, turn on
+Two tabs on the same document stay in sync, and neither overwrites the other's comments, including a tab closed
+right after a change. Without a mouse, turn on
 Chrome's caret browsing (`F7`) and select with `Shift` and the arrow keys.
 
 ### Live reload and Chrome's file permission
@@ -87,6 +88,11 @@ that prompt; if you pick it, the click isn't needed next time. Nothing is lost w
 isn't watching the file.
 
 A file chosen through the fallback file dialog, or pasted text, is a snapshot: it never reloads.
+
+On Chrome 153 and early 154 builds, a file is followed only in the tab that opened it: another tab, or a reload,
+shows the saved copy with **Reconnect**. Those builds crash the whole browser when an Incognito window reads a
+file's permission back from storage, and a page can't tell an Incognito window apart. Chrome 154.0.8037.95 and
+later don't need this.
 
 ### Privacy
 

@@ -260,23 +260,33 @@ returns to the comment's note.
 
 - IndexedDB `markdown-annotator.v1`, with a `docs` store keyed by `file:<name>[:<id>]` or `paste:<hash>`. Each record
   holds the text, the comments (each with an `updated` time), tombstones for deleted comments, the general note
-  and the path to name (each with its own timestamp), the `FileSystemFileHandle`, `loadedAt`, and
-  `updatedAt`. Files with the same name are told apart with `isSameEntry`. A file opened without a handle
-  joins only a record that never had one. Settings and the per-document scroll position are kept in
-  `localStorage`.
+  and the path to name (each with its own timestamp), `live` when it follows a file on disk, `loadedAt`, and
+  `updatedAt`. A record never holds the `FileSystemFileHandle`: Chrome 153 and 154 crash the whole browser when a
+  tab closes while an IndexedDB write holding a handle is in flight. Each handle is kept in the `meta` store
+  under `handle:<key>`, written when the file is opened or reconnected and read only when a tab restores or
+  reopens that document (records saved by 1.0.0 are moved over on the next start). Files with the same name are
+  told apart with `isSameEntry`. A file opened without a handle joins only a record that never had one.
+  Settings and the per-document scroll position are kept in `localStorage`.
 - Every save is a read-merge-write in one IndexedDB transaction. Comments merge by id: the newer `updated`
   wins, and a tombstone wins over anything older than itself. Two tabs therefore never overwrite each other.
-  Discrete actions save at once. `pagehide` also writes a small synchronous `localStorage` journal, which the
-  next start merges back in, so a reload right after saving loses nothing.
+  Discrete actions save at once. A page being hidden saves only when something changed since the last save,
+  and `pagehide` starts no IndexedDB work at all: it writes a small synchronous `localStorage` journal (one per
+  tab) when something is unsaved. Another open tab merges that journal at once (the `storage` event), or the
+  next start does, so closing or reloading right after a change loses nothing.
 - Each tab restores its own document after a reload (`sessionStorage`); a new tab opens the most recent one.
   Close document sticks. At most 30 documents are kept. Forget and **Forget all** (start screen) both offer
   Undo. If IndexedDB is unavailable, the page says so and keeps everything in memory for the tab.
 - A refresh restores the last document immediately from the cached text. If Chrome still grants read
   permission, watching resumes; otherwise a "Reconnect" button asks for it.
+- Chrome 153 and early 154 builds (before 154.0.8037.95) crash the whole browser when an Incognito or Guest
+  window reads a file handle back from IndexedDB (crbug 562119515), and a page can't tell those windows apart.
+  On those builds a document follows its file only in the tab that opened it; another tab or a reload shows
+  the saved copy with Reconnect, and picking or dropping the same file there rejoins the same document.
 - The start screen lists up to 8 recent documents, with their comment counts. Opening one asks for permission
   inside the click.
 - Other tabs showing the same document merge its saved comments in through `BroadcastChannel`. A tab with its
-  composer open waits until the composer closes.
+  composer open waits until the composer closes. A start screen refreshes its list at most every 250 ms, and
+  only while it is visible.
 
 ## Safety
 

@@ -40,9 +40,10 @@
 
   function debounce(fn, ms) {
     let t = 0;
-    const d = (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-    d.flush = (...args) => { clearTimeout(t); return fn(...args); };
-    d.cancel = () => clearTimeout(t);
+    const d = (...args) => { clearTimeout(t); t = setTimeout(() => { t = 0; fn(...args); }, ms); };
+    d.flush = (...args) => { clearTimeout(t); t = 0; return fn(...args); };
+    d.cancel = () => { clearTimeout(t); t = 0; };
+    d.pending = () => t !== 0;
     return d;
   }
 
@@ -328,6 +329,10 @@
   const store = (() => {
     let dbp = null;
     const mem = { docs: new Map(), meta: new Map() };
+    // A record never carries a file handle. Chrome 153 and 154 crash the whole browser when a tab closes
+    // while an IndexedDB write holding one is in flight, and every save writes the record, so handles are
+    // kept apart in meta (see handleFor) and only written when a file is opened.
+    const bare = (r) => { if (!r || !('handle' in r)) return r; const { handle, ...rest } = r; return rest; };
     let memOnly = typeof indexedDB === 'undefined';
     function open() {
       if (!dbp) {
@@ -368,7 +373,7 @@
         const get = s.get(key);
         get.onsuccess = () => {
           try {
-            out = fn(get.result || null);
+            out = bare(fn(get.result || null));
             if (out) s.put(out);
           } catch (e) { failure = e; tx.abort(); }
         };
@@ -401,19 +406,79 @@
     }
     return {
       get: (key) => attempt(() => run('docs', 'readonly', (s) => s.get(key)), () => mem.docs.get(key)),
-      put: (rec) => { mem.docs.set(rec.key, rec); return attempt(() => run('docs', 'readwrite', (s) => s.put(rec)), () => null); },
-      update: (key, fn) => attempt(() => update(key, fn), () => { const out = fn(mem.docs.get(key) || null); if (out) mem.docs.set(key, out); return out; }),
+      put: (rec) => { rec = bare(rec); mem.docs.set(rec.key, rec); return attempt(() => run('docs', 'readwrite', (s) => s.put(rec)), () => null); },
+      update: (key, fn) => attempt(() => update(key, fn), () => { const out = bare(fn(mem.docs.get(key) || null)); if (out) mem.docs.set(key, out); return out; }),
       del: (key) => { mem.docs.delete(key); return attempt(() => run('docs', 'readwrite', (s) => s.delete(key)), () => null); },
       delIf: (key, ok) => { const m = mem.docs.get(key); if (m && ok(m)) mem.docs.delete(key); return attempt(() => delIf(key, ok), () => null); },
       all: () => attempt(() => run('docs', 'readonly', (s) => s.getAll()).then((r) => r || []), () => [...mem.docs.values()]),
       getMeta: (k) => attempt(() => run('meta', 'readonly', (s) => s.get(k)).then((r) => r && r.v), () => mem.meta.get(k)),
       setMeta: (k, v) => { mem.meta.set(k, v); return attempt(() => run('meta', 'readwrite', (s) => s.put({ k, v })), () => null); },
+      delMeta: (k) => { mem.meta.delete(k); return attempt(() => run('meta', 'readwrite', (s) => s.delete(k)), () => null); },
+      // Keys only: listing them never reads a handle back.
+      metaKeys: () => attempt(() => run('meta', 'readonly', (s) => s.getAllKeys()).then((r) => r || []), () => [...mem.meta.keys()]),
       clear: () => { mem.docs.clear(); return attempt(() => run('docs', 'readwrite', (s) => s.clear()), () => null); },
     };
   })();
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(NS) : null;
   const KEEP_RECORDS = 30;
   const KEEP_COPIES = 5;
+
+  // File handles, kept apart from the records (see bare): a record that follows a file says `live`, and its
+  // handle is stored under meta 'handle:<key>', written when the file is opened or reconnected and read only
+  // when a tab restores or reopens that document.
+  const handles = new Map();
+  const handleKey = (key) => 'handle:' + key;
+  const isLive = (r) => !!(r && (r.live || r.handle));
+  let handleReadsSafe = true;
+  function keepHandle(key, handle) {
+    if (!handle || handles.get(key) === handle) return;
+    handles.set(key, handle);
+    // A handle that can't be stored still lets this tab follow the file.
+    Promise.resolve(store.setMeta(handleKey(key), handle)).catch(() => {});
+  }
+  async function handleFor(key) {
+    if (handles.has(key)) return handles.get(key);
+    if (!handleReadsSafe) return null;
+    let h = null;
+    try { h = (await store.getMeta(handleKey(key))) || null; } catch { h = null; }
+    if (h) handles.set(key, h);
+    return h;
+  }
+  // Chrome 153 and early 154 builds crash the whole browser when an Incognito or Guest window reads a file
+  // handle back from IndexedDB (crbug 562119515; fixed by 154.0.8037.95 and 155.0.8059.12), and a page can't
+  // tell those windows apart. There a document follows its file only in the tab that opened it, and other
+  // tabs offer Reconnect.
+  async function checkHandleReads() {
+    const forced = window.__markdownAnnotatorHandleReads; // tests only
+    if (typeof forced === 'boolean') { handleReadsSafe = forced; return; }
+    let v = '';
+    try {
+      const uad = navigator.userAgentData;
+      if (uad && uad.getHighEntropyValues) {
+        const { fullVersionList = [] } = await uad.getHighEntropyValues(['fullVersionList']);
+        const b = fullVersionList.find((x) => x.brand === 'Chromium');
+        if (b) v = b.version;
+      }
+    } catch { /* fall back to the user agent string */ }
+    if (!v) { const m = /Chrom(?:e|ium)\/(\d+(?:\.\d+)*)/.exec(navigator.userAgent); if (m) v = m[1]; }
+    const [major = 0, , build = 0, patch = 0] = v.split('.').map((x) => parseInt(x, 10) || 0);
+    handleReadsSafe = !(major === 153 || (major === 154 && (build < 8037 || (build === 8037 && patch < 95)))
+      || (major === 155 && build === 8059 && patch < 12));
+  }
+  // Before 1.0.1 each record carried its file handle: move any such handle to its own entry, once, and drop
+  // handle entries whose record is gone (keys are listed first, so a document opened meanwhile keeps its own).
+  async function tidyHandles() {
+    let keys = [];
+    let recs = [];
+    try { keys = await store.metaKeys(); recs = await store.all(); } catch { return; }
+    const known = new Set(recs.map((r) => r.key));
+    for (const r of recs) {
+      if (!r.handle) continue;
+      try { await store.setMeta(handleKey(r.key), r.handle); } catch { continue; }
+      try { await store.update(r.key, (cur) => (cur ? { ...cur, live: true } : null)); } catch { /* next start */ }
+    }
+    for (const k of keys) if (typeof k === 'string' && k.startsWith('handle:') && !known.has(k.slice(7))) store.delMeta(k);
+  }
 
   // ---------------------------------------------------------------------------
   // State
@@ -477,7 +542,7 @@
       name: d.name,
       source: d.source,
       text: d.text,
-      handle: d.handle || null,
+      live: !!(d.handle || d.live),
       lastModified: d.lastModified || 0,
       size: d.size || 0,
       loadedAt: state.loadedAt,
@@ -513,7 +578,7 @@
     const t = (local.loadedAt || 0) >= (stored.loadedAt || 0) ? local : stored;
     return {
       ...local,
-      handle: local.handle || stored.handle || null,
+      live: !!(local.live || stored.live || stored.handle),
       text: t.text, loadedAt: t.loadedAt || 0, lastModified: t.lastModified || 0, size: t.size || 0,
       comments, deleted,
       general: g.general || '', generalAt: g.generalAt || 0, generalSent: !!g.generalSent, generalSentAt: g.generalSentAt || 0,
@@ -561,19 +626,28 @@
     }
   }
 
+  // What a save writes, in brief: a page being hidden saves only when this differs from the last save.
+  const saveSig = () => (state.doc ? [state.doc.key, state.loadedAt, state.generalAt, !!state.generalSent, state.generalSentAt || 0,
+    state.pathAt, !!state.doc.copy, !!(state.doc.handle || state.doc.live), Object.keys(state.deleted).length,
+    state.lastBatch ? JSON.stringify(state.lastBatch).length : 0, state.comments.map((c) => `${c.id}:${c.updated || 0}`).join(',')].join('|') : '');
+  let savedSig = '';
+  const dirty = () => !!state.doc && (saveSoon.pending() || saveSig() !== savedSig);
+
   let saving = Promise.resolve();
   let closing = false;
   function saveNow() {
     if (!state.doc) return saving;
     const doc = state.doc;
+    const sig = saveSig();
     const local = serialize();
     saving = saving.then(async () => {
       let merged = null;
-      try {
-        merged = await store.update(local.key, (stored) => mergeRecords(local, stored));
-      } catch {
-        local.handle = null; // a handle that cannot be stored must not cost the comments
-        try { merged = await store.update(local.key, (stored) => mergeRecords(local, stored)); } catch { /* memory copy kept */ }
+      try { merged = await store.update(local.key, (stored) => mergeRecords(local, stored)); } catch { /* memory copy kept */ }
+      if (merged) {
+        if (state.doc === doc) savedSig = sig;
+        // A journal this tab wrote before this save is covered now.
+        const j = lsGet(journalKey(local.key), null);
+        if (j && (j.at || 0) <= local.updatedAt) lsSet(journalKey(local.key), null);
       }
       if (merged && state.doc === doc) adoptMerged(merged);
       if (state.doc && state.doc.key === local.key && !closing) {
@@ -587,30 +661,56 @@
   const saveSoon = debounce(saveNow, 300);
   const scrollKey = (key) => `${NS}.scroll.${key}`;
   const saveScroll = debounce(() => { if (state.doc && !docEl.hidden) lsSet(scrollKey(state.doc.key), captureScroll()); }, 400);
-  // An IndexedDB write started during unload may never commit; a synchronous journal covers that gap.
+  // An IndexedDB write started during unload may never commit; a synchronous journal covers that gap. Each
+  // tab writes its own, and another open tab merges it at once (the storage event), or the next start does.
+  const journalKey = (key) => `${NS}.journal.${TAB_ID}.${key}`;
   function writeJournal() {
     if (!state.doc) return;
-    lsSet(`${NS}.journal.${state.doc.key}`, {
+    lsSet(journalKey(state.doc.key), {
       key: state.doc.key, at: now(), comments: state.comments.map(persistedComment), deleted: state.deleted,
       general: state.general, generalAt: state.generalAt, generalSent: state.generalSent, generalSentAt: state.generalSentAt || 0,
       path: state.path, pathAt: state.pathAt,
     });
   }
+  // Merges every journal into its record and returns the keys it updated.
   async function replayJournals() {
     let keys = [];
-    try { keys = Object.keys(localStorage).filter((k) => k.startsWith(`${NS}.journal.`)); } catch { return; }
+    try { keys = Object.keys(localStorage).filter((k) => k.startsWith(`${NS}.journal.`)); } catch { return []; }
+    const done = new Set();
     for (const k of keys) {
       const j = lsGet(k, null);
       lsSet(k, null);
       if (!j || !j.key || !Array.isArray(j.comments)) continue;
       try {
-        await store.update(j.key, (stored) => (stored ? mergeRecords({ ...stored, ...j, text: stored.text, loadedAt: stored.loadedAt, lastModified: stored.lastModified, size: stored.size, handle: stored.handle }, stored) : null));
+        await store.update(j.key, (stored) => (stored ? mergeRecords({ ...stored, ...j, text: stored.text, loadedAt: stored.loadedAt, lastModified: stored.lastModified, size: stored.size }, stored) : null));
+        done.add(j.key);
       } catch { /* ignore */ }
     }
+    return [...done];
   }
-  function flushAll() { writeJournal(); saveSoon.cancel(); saveNow(); saveScroll.flush(); }
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll(); });
-  window.addEventListener('pagehide', flushAll);
+  const replaySoon = debounce(async () => {
+    for (const key of await replayJournals()) {
+      if (state.doc && state.doc.key === key) syncFromStore();
+      else if (!state.doc) refreshEmpty();
+      if (channel) channel.postMessage({ type: 'saved', key, tab: TAB_ID });
+    }
+  }, 150);
+  window.addEventListener('storage', (e) => { if (e.key && e.key.startsWith(`${NS}.journal.`) && e.newValue) replaySoon(); });
+  // Leaving the page. Hidden may be only a tab switch, so it saves, when something changed. pagehide starts
+  // no IndexedDB work: the tab may be closing, and the journal covers whatever the save didn't finish.
+  function onHidden() {
+    saveScroll.flush();
+    if (!dirty()) return;
+    writeJournal();
+    saveSoon.cancel();
+    saveNow();
+  }
+  function onPageHide() {
+    saveScroll.flush();
+    if (dirty()) writeJournal();
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') onHidden(); });
+  window.addEventListener('pagehide', onPageHide);
 
   async function syncFromStore() {
     if (!state.doc) return;
@@ -619,10 +719,13 @@
     const rec = await store.get(state.doc.key);
     if (rec && state.doc && rec.key === state.doc.key) adoptMerged(mergeRecords(serialize(), rec));
   }
+  // The start screen's list follows other tabs' saves, at most every 250 ms and only while it shows.
+  const refreshEmpty = debounce(() => { if (!state.doc && !dom.empty.hidden && document.visibilityState === 'visible') showEmpty(); }, 250);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshEmpty(); });
   if (channel) {
     channel.onmessage = ({ data }) => {
       if (!data || data.tab === TAB_ID) return;
-      if (!state.doc) { if (!dom.empty.hidden) showEmpty(); return; }
+      if (!state.doc) { refreshEmpty(); return; }
       if (data.key === state.doc.key) syncFromStore();
     };
   }
@@ -1288,25 +1391,33 @@
     if (!all.length) return { rec: null, taken: false };
     if (handle) {
       for (const r of all) {
-        if (!r.handle) continue;
-        try { if (await r.handle.isSameEntry(handle)) return { rec: r, taken: true }; } catch { /* stale handle */ }
+        if (!isLive(r)) continue;
+        const h = await handleFor(r.key);
+        if (!h) continue;
+        try { if (await h.isSameEntry(handle)) return { rec: r, taken: true }; } catch { /* stale handle */ }
       }
+      // A followed document whose handle this tab can't read (see handleFor) takes its file back from
+      // Reconnect, while it is the open document, or when the file still has the same text.
+      const unknown = all.filter((r) => isLive(r) && !handles.has(r.key));
+      const again = unknown.find((r) => r.key === reconnectKey) || unknown.find((r) => state.doc && r.key === state.doc.key)
+        || unknown.find((r) => text != null && r.text === text);
+      if (again) return { rec: again, taken: true };
     }
     // A link or a script names the file by its path: it joins the record for that path, even one the
     // person follows live; without a path, only a record that has neither a path nor a live file.
-    const plain = (r) => !r.handle && !r.path;
+    const plain = (r) => !isLive(r) && !r.path;
     // A file the person opened themselves has no path until one is typed: a link with a path adopts it.
     // For one path: a document the person follows live first, then the same text (a repeat never makes a
     // new copy), then the original over separate copies. Without a path, only plain records count.
     if (shared) {
       const pool = path ? all.filter((r) => (r.path || '') === path) : all.filter(plain);
-      const rec = (path && pool.find((r) => r.handle)) || pool.find((r) => r.text === text) || pool.find((r) => !provisional(r)) || pool[0]
-        || (path ? all.find((r) => r.handle && !r.path) || all.find(plain) : null) || null;
+      const rec = (path && pool.find(isLive)) || pool.find((r) => r.text === text) || pool.find((r) => !provisional(r)) || pool[0]
+        || (path ? all.find((r) => isLive(r) && !r.path) || all.find(plain) : null) || null;
       return { rec, taken: true };
     }
     // Without a matching handle, join only a record that never had one: another project's
     // handle-backed PLAN.md must not absorb this file.
-    return { rec: all.find((r) => !r.handle && !provisional(r)) || all.find((r) => !r.handle) || null, taken: true };
+    return { rec: all.find((r) => !isLive(r) && !provisional(r)) || all.find((r) => !isLive(r)) || null, taken: true };
   }
 
   // Sent comments were handed over. Once the file changes after they were sent, they belong to an
@@ -1373,7 +1484,7 @@
     state.pendingText = null;
     state.pendingAt = 0;
     dom.pending.hidden = true;
-    state.doc = { key, name, source, text, handle, lastModified, size, copy: copy && (!rec || provisional(rec)) };
+    state.doc = { key, name, source, text, handle, live: !!handle || isLive(rec), lastModified, size, copy: copy && (!rec || provisional(rec)) };
     state.pendingMeta = null;
     watch.seen = handle ? `${lastModified}:${size}` : null;
     ssSet(`${NS}.tab`, key);
@@ -1396,6 +1507,7 @@
     if (handle) startWatch();
     else setLive(source === 'paste' ? 'none' : 'snapshot');
     await saveNow();
+    if (handle) keepHandle(key, handle); // after the record, so tidyHandles never takes it for an orphan
     pruneRecords();
   }
 
@@ -1651,15 +1763,16 @@
   async function reopen(key) {
     const rec = await store.get(key);
     if (!rec) { showEmpty(); return false; }
-    if (rec.handle) {
+    const handle = isLive(rec) ? await handleFor(key) : null;
+    if (handle) {
       let granted = false;
-      try { granted = (await rec.handle.requestPermission({ mode: 'read' })) === 'granted'; } catch { granted = false; }
+      try { granted = (await handle.requestPermission({ mode: 'read' })) === 'granted'; } catch { granted = false; }
       if (granted) {
         try {
-          const file = await rec.handle.getFile();
+          const file = await handle.getFile();
           const r = await readText(file);
           if (!r.binary) {
-            await openDocument({ name: rec.name, text: normalizeSource(r.text), handle: rec.handle, lastModified: file.lastModified, size: file.size, source: 'file' });
+            await openDocument({ name: rec.name, text: normalizeSource(r.text), handle, lastModified: file.lastModified, size: file.size, source: 'file' });
             return true;
           }
         } catch { /* moved or deleted: fall back to the saved copy */ }
@@ -1670,20 +1783,23 @@
   }
 
   async function restoreRecord(rec) {
+    const live = isLive(rec);
+    const handle = live ? await handleFor(rec.key) : null;
     loadRecordState(rec);
-    state.doc = { key: rec.key, name: rec.name, source: rec.source || 'file', text: rec.text, handle: rec.handle || null, lastModified: rec.lastModified || 0, size: rec.size || 0, copy: provisional(rec) };
+    state.doc = { key: rec.key, name: rec.name, source: rec.source || 'file', text: rec.text, handle, live, lastModified: rec.lastModified || 0, size: rec.size || 0, copy: provisional(rec) };
+    savedSig = saveSig();
     state.lastRead = 0;
     state.pendingMeta = null;
     watch.seen = null; // read the file once even if its metadata matches the cache
     ssSet(`${NS}.tab`, rec.key);
     showDocument();
     render(rec.text, { scroll: lsGet(scrollKey(rec.key), null) });
-    if (rec.handle) {
+    if (handle) {
       let perm = 'prompt';
-      try { perm = await rec.handle.queryPermission({ mode: 'read' }); } catch { /* unsupported */ }
+      try { perm = await handle.queryPermission({ mode: 'read' }); } catch { /* unsupported */ }
       if (perm === 'granted') { startWatch(); checkFile(); } else setLive('perm');
     } else {
-      setLive(rec.source === 'paste' ? 'none' : 'snapshot');
+      setLive(live ? 'perm' : rec.source === 'paste' ? 'none' : 'snapshot');
     }
     store.setMeta('last', rec.key);
   }
@@ -1744,10 +1860,15 @@
   window.addEventListener('blur', () => setTimeout(() => tryApplyPending(), 0));
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkFile(); });
 
+  let reconnectKey = null; // the document Reconnect is picking a file for (see findRecord)
   async function reconnect() {
     const d = state.doc;
     if (!d) return;
-    if (state.liveMode === 'missing' || !d.handle) { pickFile(); return; }
+    if (state.liveMode === 'missing' || !d.handle) {
+      reconnectKey = d.key;
+      try { await pickFile(); } finally { reconnectKey = null; }
+      return;
+    }
     let perm = 'denied';
     try { perm = await d.handle.requestPermission({ mode: 'read' }); } catch { /* ignore */ }
     if (perm === 'granted') { setLive('on'); startWatch(); await checkFile(true); }
@@ -1763,7 +1884,9 @@
     dom.reconnect.textContent = mode === 'missing' ? 'File missing' : 'Reconnect';
     dom.reconnect.title = mode === 'missing'
       ? `${name} was moved or deleted. Showing the last copy; click to open it again.`
-      : `Showing the copy loaded at ${hhmm(state.loadedAt || now())}. Click to let Chrome re-read ${name} and reload it when it changes.`;
+      : state.doc && !state.doc.handle
+        ? `Showing the saved copy. Click to open ${name} again, so this page follows it.`
+        : `Showing the copy loaded at ${hhmm(state.loadedAt || now())}. Click to let Chrome re-read ${name} and reload it when it changes.`;
     dom.live.hidden = !(mode === 'on' || mode === 'off');
     dom.live.classList.toggle('off', mode !== 'on');
     dom.live.title = mode === 'on' ? `Watching ${name}; it reloads when the file changes` : `Can't read ${name} right now`;
@@ -3218,7 +3341,7 @@
     let { rec } = await findRecord(n, null, p, true, body);
     const other = !!(web && rec && (rec.path || '') !== p);
     if (other) rec = null;
-    if (rec && rec.handle) {
+    if (rec && isLive(rec)) {
       // The person follows this file live: show that document, which reads the file itself. If the file
       // can't be read just now, the link's text is newer than the saved copy, so it comes in as an update.
       await leaveCurrent();
@@ -3356,6 +3479,8 @@
     applySettings();
     buildKeys();
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    await checkHandleReads();
+    await tidyHandles();
     await replayJournals();
     window.addEventListener('hashchange', () => { openFromLink(); });
     if (await openFromLink()) return;
@@ -3416,6 +3541,8 @@
     openText: (name, text, source = 'file') => openDocument({ name, text: normalizeSource(text), source }),
     openHandle: (handle) => openHandle(handle),
     records: () => store.all(),
+    metaKeys: () => store.metaKeys(),
+    get handleReadsSafe() { return handleReadsSafe; },
     applyUpdate: (text) => applyUpdate(normalizeSource(text)),
     copy: (opts) => copyReview(opts),
     selectText(exact, nth = 0) {

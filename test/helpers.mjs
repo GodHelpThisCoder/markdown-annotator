@@ -1,7 +1,8 @@
 // Shared helpers for the end-to-end regression suite (test/e2e.test.mjs).
 // Runs markdown-annotator.html from file:// in the locally installed Chrome (headless) through playwright-core.
 import { chromium } from 'playwright-core';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -13,6 +14,35 @@ export const EDGE = fixture('EDGE.md');
 
 export async function launch(extra = {}) {
   return chromium.launch({ channel: 'chrome', headless: true, timeout: 30000, ...extra });
+}
+
+/**
+ * Chrome as a person runs it: an ordinary (not off-the-record) profile in a fresh temp folder, and none of
+ * Playwright's default flags (it adds --no-sandbox, among others). The tab-close crash with file handles
+ * (see the store in src/app.js) needs this setup to show up reliably. `crashed()` says whether the whole
+ * browser went away.
+ */
+export async function launchProfile() {
+  const dir = mkdtempSync(join(tmpdir(), 'ma-profile-'));
+  const ctx = await chromium.launchPersistentContext(dir, {
+    channel: 'chrome', headless: true, timeout: 30000, ignoreDefaultArgs: true,
+    args: ['--remote-debugging-pipe', `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check', '--headless', 'about:blank'],
+  });
+  let gone = false;
+  ctx.on('close', () => { gone = true; });
+  return {
+    ctx,
+    crashed: () => gone,
+    async close() { if (!gone) await ctx.close().catch(() => {}); try { rmSync(dir, { recursive: true, force: true }); } catch { /* still locked */ } },
+  };
+}
+
+/** Drop a real file from disk onto the page, as from Finder or Explorer: the page gets a real file handle. */
+export async function dropFile(page, path) {
+  const cdp = await page.context().newCDPSession(page);
+  const data = { items: [], files: [path], dragOperationsMask: 1 };
+  for (const type of ['dragEnter', 'dragOver', 'drop']) await cdp.send('Input.dispatchDragEvent', { type, x: 200, y: 200, data });
+  await cdp.detach();
 }
 
 // Platform emulation: the app reads navigator.userAgentData.platform, then navigator.platform.
